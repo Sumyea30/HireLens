@@ -1,0 +1,125 @@
+# One command to build and start everything:  docker compose up --build
+# Config comes from .env (copy .env.example). Never commit .env.
+
+x-backend: &backend
+  build:
+    context: .
+    dockerfile: backend/Dockerfile
+  image: hirelens-backend:latest
+  env_file: .env
+  environment:
+    # Built from the Postgres settings so the values cannot drift apart.
+    DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+    REDIS_URL: redis://redis:6379/0
+    # API, worker and mail-ingest share this volume, so a stored CV is visible to screening.
+    CV_DIR: /data/stored_cvs
+    TRANSCRIPT_DIR: /data/transcripts
+  restart: unless-stopped
+  networks: [hirelens]
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks: [hirelens]
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks: [hirelens]
+
+  api:
+    <<: *backend
+    # The app creates its own tables on startup (idempotent), so no migration step is needed yet.
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"   # OpenAPI docs at http://localhost:8000/docs (N24)
+    volumes:
+      - cv_files:/data/stored_cvs
+      - transcript_files:/data/transcripts
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # Screens queued CVs with Graph A. Broker is the redis service above.
+  worker:
+    <<: *backend
+    command: ["celery", "-A", "app.workers.celery_app", "worker", "--loglevel=INFO"]
+    volumes:
+      - cv_files:/data/stored_cvs
+      - transcript_files:/data/transcripts
+    depends_on:
+      api:
+        condition: service_healthy
+
+  # TODO: comment out until mail_ingest/main.py exists.
+  mail-ingest:
+    <<: *backend
+    command: ["python", "-m", "mail_ingest.main"]
+    volumes:
+      - cv_files:/data/stored_cvs
+      - transcript_files:/data/transcripts
+    depends_on:
+      api:
+        condition: service_healthy
+
+  # Optional: a separate realtime service. Otherwise keep WebSockets in the api
+  # service. If you enable it, point the /ws/ location in frontend/nginx.conf
+  # to realtime:8001.
+  # realtime:
+  #   <<: *backend
+  #   command: ["uvicorn", "app.realtime.main:app", "--host", "0.0.0.0", "--port", "8001"]
+  #   depends_on:
+  #     api:
+  #       condition: service_healthy
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    ports:
+      - "8080:80"     # open http://localhost:8080
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [hirelens]
+
+volumes:
+  pgdata:
+  redisdata:
+  cv_files:
+  transcript_files:
+
+networks:
+  hirelens:
+    name: hirelens-net
