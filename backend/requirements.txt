@@ -1,0 +1,18 @@
+# Pinned versions (N11). Re-generate with: pip freeze after testing upgrades.
+# Runtime
+fastapi==0.142.2
+uvicorn==0.54.0
+pydantic==2.13.5
+httpx==0.28.1
+python-multipart==0.0.32
+python-dotenv==1.0.1
+langgraph==1.2.12
+celery==5.6.3
+redis==5.2.1
+langgraph-checkpoint-postgres==3.1.2
+psycopg[binary]==3.3.6
+pymupdf==1.28.2
+python-docx==1.2.0
+mcp==2.3.0
+# Tests
+pytest==9.1.1
