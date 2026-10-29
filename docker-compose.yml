@@ -1,0 +1,87 @@
+# One command to build and start everything:  docker compose up --build
+# Settings come from .env (copy .env.example). Never commit .env.
+
+x-backend: &backend
+  build:
+    context: .
+    dockerfile: backend/Dockerfile
+  image: hirelens-backend:latest
+  env_file: .env
+  environment:
+    # Built from the Postgres settings so the values cannot drift apart.
+    DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+    CV_DIR: /data/stored_cvs
+    LOG_DIR: /data/logs
+  restart: unless-stopped
+  networks: [hirelens]
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks: [hirelens]
+
+  api:
+    <<: *backend
+    # The app creates its own tables on startup (idempotent), so no migration step is needed.
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"   # OpenAPI docs at http://localhost:8000/docs
+    volumes:
+      - cv_files:/data/stored_cvs
+      - app_logs:/data/logs
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # Reads the application mailbox (IMAP_* in .env) and turns CV emails into candidates.
+  # Without IMAP settings it idles harmlessly.
+  mail-ingest:
+    <<: *backend
+    command: ["python", "-m", "mail_ingest.main"]
+    volumes:
+      - cv_files:/data/stored_cvs
+    depends_on:
+      api:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        VITE_USE_MOCK: "false"
+    ports:
+      - "8080:80"     # open http://localhost:8080
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [hirelens]
+
+volumes:
+  pgdata:
+  cv_files:
+  app_logs:
+
+networks:
+  hirelens:
+    name: hirelens-net
