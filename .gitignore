@@ -1,0 +1,106 @@
+# ---------------------------------------------------------------
+# Secrets: never commit
+# ---------------------------------------------------------------
+.env
+.env.*
+!.env.example
+!**/.env.example
+*.pem
+*.key
+*.p12
+credentials.json
+token.json
+tokens.json
+*.local.json
+
+# ---------------------------------------------------------------
+# Candidate and personal data
+# ---------------------------------------------------------------
+sample-cvs/
+mail_attachments/
+uploads/
+recordings/
+stt-clips/
+stt_debug_dumps/
+backend/stt_debug_dumps/
+stt_benchmark/
+benchmark-audio/
+transcripts/
+stored_transcripts/
+backend/stored_transcripts/
+stored_cvs/
+backend/stored_cvs/
+stored_photos/
+backend/stored_photos/
+backend/tests/_face_*.jpg
+exports/
+*.transcript.json
+*.eml
+*.mbox
+*.pdf
+*.docx
+*.zip
+screenshots/
+demo-raw/
+
+# ---------------------------------------------------------------
+# Uploaded policy documents (only synthetic ones go in sample-policies/)
+# ---------------------------------------------------------------
+policy_uploads/
+
+# ---------------------------------------------------------------
+# Databases, dumps and local volumes
+# ---------------------------------------------------------------
+dumps/
+*.dump
+*.bak
+*.sqlite
+*.sqlite3
+*.db
+pgdata/
+redisdata/
+
+# ---------------------------------------------------------------
+# Docker (local only)
+# ---------------------------------------------------------------
+docker-compose.override.yml
+
+# ---------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# ---------------------------------------------------------------
+# Node and frontend build output
+# ---------------------------------------------------------------
+node_modules/
+dist/
+frontend/dist/
+frontend/build/
+.vite/
+npm-debug.log*
+yarn-error.log*
+
+# ---------------------------------------------------------------
+# Logs
+# ---------------------------------------------------------------
+*.log
+logs/
+
+# ---------------------------------------------------------------
+# IDE and OS files
+# ---------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
