@@ -1,7 +1,8 @@
 import type {
   ApprovalDecision, Assessment, AssessmentSummary, AssistantReply, AuditEvent, Candidate,
-  CandidateDetail, CopilotReply, CvBatchResult, CvReview, DashboardSummary, EvidenceItem, Interview, InterviewBrief,
-  InterviewNote, Job, Policy, Session, TranscriptDocument, UploadResult,
+  CandidateDetail, CopilotReply, CvBatchResult, CvReview, DashboardSummary, EvidenceItem, FaceCheckResult,
+  FunnelReport, FunnelSuggestResult, Interview, InterviewBrief, InterviewNote, Job, Policy, Session,
+  TranscriptDocument, TranscriptTurn, UploadResult,
 } from "../lib/types";
 import type { LogEntry } from "../lib/logger";
 
@@ -15,10 +16,14 @@ export interface Api {
   listJobs(): Promise<Job[]>;
   getJob(id: string): Promise<Job>;
   updateWeights(id: string, weights: Record<string, number>): Promise<Job>;
+  getFunnel(jobId: string): Promise<FunnelReport>;
+  suggestFunnelRevision(jobId: string): Promise<FunnelSuggestResult>;
   assistantMessage(jobId: string | null, message: string, template?: string): Promise<AssistantReply>;
   getAssistant(jobId: string): Promise<AssistantReply>;
   submitApproval(jobId: string, decision: ApprovalDecision): Promise<AssistantReply>;
 
+  /** Poll the application inbox for new CV emails (no-op if mail is not configured). */
+  checkMail(): Promise<{ ok: boolean; skipped?: string | null; counts?: Record<string, number> }>;
   listCandidates(jobId?: string): Promise<Candidate[]>;
   getCandidate(id: string): Promise<CandidateDetail>;
   uploadCvs(jobId: string, files: File[]): Promise<UploadResult[]>;
@@ -32,7 +37,9 @@ export interface Api {
   rescheduleInterview(id: string, startsAt: string): Promise<Interview>;
   endInterview(id: string): Promise<void>;
   getTranscript(id: string): Promise<TranscriptDocument>;
+  editTranscriptTurn(id: string, turnId: string, text: string): Promise<TranscriptTurn>;
   getBrief(id: string): Promise<InterviewBrief>;
+  faceCheck(id: string, image: Blob): Promise<FaceCheckResult>;
   copilotQuota(id: string): Promise<{ remaining: number; limit: number }>;
   askCopilot(id: string, message: string): Promise<CopilotReply>;
   getNotes(id: string): Promise<InterviewNote>;

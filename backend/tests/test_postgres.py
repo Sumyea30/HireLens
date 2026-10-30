@@ -113,7 +113,7 @@ def test_candidates_applications_and_cascading_deletion(store):
     d = store.dashboard()
     assert d["applications_total"] == 2 and d["awaiting_screening"] == 2 and d["open_jobs"] == 1
 
-    assert store.delete_candidate("cand-1") == "/data/cand-1.pdf"
+    assert store.delete_candidate("cand-1") == {"file_path": "/data/cand-1.pdf", "photo_path": ""}
     assert store.delete_candidate("cand-1") is None
     assert not store.application_seen("h1") and store.search("cv:cand-1", "Django", 3) == []        # application and vectors went too
     assert store.get_job("job-1") is not None and store.get_candidate("cand-3") is not None          # nothing else was touched
@@ -139,8 +139,11 @@ def _services(url, tmp_path, store):
     cm = PostgresSaver.from_conn_string(url)
     saver = cm.__enter__()
     saver.setup()
-    svc = Services(settings(), store, deps, build_job_post_graph(deps, saver), PolicyService(store),
-                   IntakeService(store, CVStorage(str(tmp_path / "cvs")), 10))
+    from tests.helpers_f2 import wired_intake
+    intake, photos, face = wired_intake(tmp_path, store)
+    svc = Services(settings(photo_dir=str(tmp_path / "photos")), store, deps,
+                   build_job_post_graph(deps, saver), PolicyService(store), intake)
+    svc.photos, svc.face = photos, face
     svc.stack.callback(lambda: cm.__exit__(None, None, None))
     return svc, channel
 
@@ -173,7 +176,11 @@ def test_whole_flow_on_postgres_across_restarts(url, store, tmp_path):
     assert count(store, "SELECT count(*) AS n FROM posting_decision WHERE job_id=%s AND action='approve' AND approver_role='interviewer'", job_id) == 1
     assert count(store, "SELECT count(*) AS n FROM publish_result WHERE job_id=%s AND status='ok'", job_id) == 1
 
-    up = c3.post(f"/jobs/{job_id}/cvs", headers=h, files=[("files", ("a.pdf", PDF, "application/pdf")), ("files", ("b.docx", make_docx(), "application/zip"))]).json()
+    from tests.helpers_f2 import make_cv_docx
+    up = c3.post(f"/jobs/{job_id}/cvs", headers=h, files=[
+        ("files", ("a.docx", make_cv_docx(email="a@example.com"), "application/zip")),
+        ("files", ("b.docx", make_cv_docx(email="b@example.com"), "application/zip")),
+    ]).json()
     assert [x["status"] for x in up] == ["queued", "queued"]
     cands = c3.get(f"/candidates?job_id={job_id}", headers=h).json()
     assert len(cands) == 2 and c3.get("/dashboard/summary", headers=h).json()["applications_total"] == 2
@@ -183,5 +190,6 @@ def test_whole_flow_on_postgres_across_restarts(url, store, tmp_path):
     store.index(f"cv:{cands[0]['id']}", [{"id": "c001", "text": "Python developer"}])
     assert c3.delete(f"/admin/candidates/{cands[0]['id']}", headers=admin).status_code == 204
     assert len(list((tmp_path / "cvs").iterdir())) == 1 and count(store, "SELECT count(*) AS n FROM vector_item WHERE collection LIKE 'cv:%%'") == 0
-    assert {e["action"] for e in c3.get("/audit", headers=h).json()} >= {"job_created", "post_approved", "cv_received", "candidate_deleted", "policy_uploaded"}
+    assert c3.get("/audit", headers=h).status_code == 403
+    assert {e["action"] for e in c3.get("/audit", headers=admin).json()} >= {"job_created", "post_approved", "cv_received", "candidate_deleted", "policy_uploaded"}
     svc3.stack.close()

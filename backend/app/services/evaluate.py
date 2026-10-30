@@ -175,6 +175,11 @@ def run_evaluation(services, interview: dict) -> dict:
     budget = max(500, settings.eval_input_tokens - estimate_tokens(notes) - 400)
     token = output_limit.set(settings.eval_output_tokens)
     try:
+        from app.services.language_guard import usable_for_prompts
+        # Flagged non-English turns stay out of prompts until an interviewer edits them.
+        turns = [t for t in turns if usable_for_prompts(t)]
+        if not turns:
+            raise NotReady("No English transcript turns are ready to evaluate yet.")
         condensed = _shrink(services.deps.llm, turns, budget)
         repo = _EvalRepo(store, notes, condensed)
         deps = replace(services.deps, repo=repo)

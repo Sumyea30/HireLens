@@ -24,7 +24,7 @@ COPY backend/app ./app
 # Non-root user. The data directory is created before the volume is mounted,
 # so the named volume inherits this ownership.
 RUN useradd --create-home --uid 1000 app \
-    && mkdir -p /data/stored_cvs \
+    && mkdir -p /data/stored_cvs /data/stored_photos \
     && chown -R app:app /app /data
 USER app
 

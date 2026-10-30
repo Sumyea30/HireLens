@@ -132,12 +132,40 @@ _CONTACT_LINE = re.compile(
 
 
 def email_from_text(text: str) -> str | None:
-    """The first real email address in CV text. Used only as the candidate's contact address."""
+    """The first real email address in CV text. Always used as the candidate's contact address."""
     from app.core.auth import valid_email
     for match in _EMAIL.finditer(text or ""):
         address = match.group(0).strip(".,;:").lower()
         if valid_email(address):
             return address
+    return None
+
+
+_NAME_LABEL = re.compile(r"^\s*(?:full\s*)?name\s*[:\-]\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+_NAME_SKIP = re.compile(
+    r"^(curriculum|resume|cv|objective|summary|profile|experience|education|skills|"
+    r"projects|certifications|employment|work\s+history|contact|email|phone|address)\b",
+    re.IGNORECASE,
+)
+
+
+def name_from_text(text: str) -> str | None:
+    """Best-effort display name from CV text. Never sent to scoring prompts or the vector store."""
+    raw = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    labeled = _NAME_LABEL.search(raw)
+    if labeled:
+        candidate = " ".join(labeled.group(1).split()).strip(" ,;|")
+        if 1 < len(candidate) <= 80 and not _EMAIL.search(candidate):
+            return candidate
+    for line in raw.split("\n")[:12]:
+        line = " ".join(line.split()).strip(" ,;|")
+        if not line or len(line) > 80 or _EMAIL.search(line) or _PHONE.search(line):
+            continue
+        if _NAME_SKIP.match(line) or _CONTACT_LINE.match(line) or _PROTECTED_LINE.match(line):
+            continue
+        words = line.split()
+        if 1 <= len(words) <= 5 and all(re.fullmatch(r"[A-Za-z][A-Za-z'.\-]*", w) for w in words):
+            return line
     return None
 
 

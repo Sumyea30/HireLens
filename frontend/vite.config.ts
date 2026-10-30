@@ -5,6 +5,7 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   plugins: [react()],
   server: {
+    host: "0.0.0.0",
     port: 5173,
     // Quick tunnels send Host: *.trycloudflare.com; Vite 8 blocks unknown hosts by default.
     allowedHosts: [".trycloudflare.com", "localhost"],

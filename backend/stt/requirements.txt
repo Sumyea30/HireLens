@@ -1,0 +1,7 @@
+# Pinned for the STT microservice (N11). Install only in the stt image.
+fastapi==0.142.2
+uvicorn==0.54.0
+python-multipart==0.0.32
+numpy==2.2.6
+faster-whisper==1.1.1
+requests==2.32.5

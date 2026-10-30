@@ -13,7 +13,9 @@ x-backend: &backend
     REDIS_URL: redis://redis:6379/0
     # API, worker and mail-ingest share this volume, so a stored CV is visible to screening.
     CV_DIR: /data/stored_cvs
+    PHOTO_DIR: /data/stored_photos
     TRANSCRIPT_DIR: /data/transcripts
+    FACE_PROVIDER: ${FACE_PROVIDER:-auto}
   restart: unless-stopped
   networks: [hirelens]
 
@@ -56,7 +58,20 @@ services:
       - "8000:8000"   # OpenAPI docs at http://localhost:8000/docs (N24)
     volumes:
       - cv_files:/data/stored_cvs
+      - photo_files:/data/stored_photos
       - transcript_files:/data/transcripts
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      CV_DIR: /data/stored_cvs
+      PHOTO_DIR: /data/stored_photos
+      TRANSCRIPT_DIR: /data/transcripts
+      STT_URL: http://stt:8090
+      STT_PROVIDER: ${STT_PROVIDER:-assemblyai}
+      STT_TIMEOUT_SECONDS: ${STT_TIMEOUT_SECONDS:-90}
+      ASSEMBLYAI_API_KEY: ${ASSEMBLYAI_API_KEY:-}
+      ASSEMBLYAI_BASE_URL: ${ASSEMBLYAI_BASE_URL:-https://api.assemblyai.com}
+      STT_LANGUAGE: ${STT_LANGUAGE:-en}
     depends_on:
       db:
         condition: service_healthy
@@ -70,12 +85,43 @@ services:
       retries: 12
       start_period: 20s
 
+  # Optional self-hosted faster-whisper. Start with: docker compose --profile whisper up -d stt
+  stt:
+    profiles: ["whisper"]
+    build:
+      context: .
+      dockerfile: backend/stt/Dockerfile
+    image: hirelens-stt:latest
+    environment:
+      STT_MODEL: ${STT_MODEL:-small}
+      STT_FALLBACK_MODEL: ${STT_FALLBACK_MODEL:-small}
+      STT_DEVICE: ${STT_DEVICE:-cpu}
+      STT_COMPUTE_TYPE: ${STT_COMPUTE_TYPE:-int8}
+      STT_LANGUAGE: ${STT_LANGUAGE:-en}
+      STT_CPU_THREADS: ${STT_CPU_THREADS:-4}
+      STT_NUM_WORKERS: ${STT_NUM_WORKERS:-1}
+    ports:
+      - "8090:8090"
+    volumes:
+      # Keep Whisper weights across recreates so live rooms are not empty while HF re-downloads.
+      - stt_cache:/home/app/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8090/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 300s
+    restart: unless-stopped
+    networks: [hirelens]
+
   # Screens queued CVs with Graph A. Broker is the redis service above.
   worker:
     <<: *backend
     command: ["celery", "-A", "app.workers.celery_app", "worker", "--loglevel=INFO"]
     volumes:
       - cv_files:/data/stored_cvs
+      - photo_files:/data/stored_photos
       - transcript_files:/data/transcripts
     depends_on:
       api:
@@ -87,6 +133,7 @@ services:
     command: ["python", "-m", "mail_ingest.main"]
     volumes:
       - cv_files:/data/stored_cvs
+      - photo_files:/data/stored_photos
       - transcript_files:/data/transcripts
     depends_on:
       api:
@@ -118,7 +165,9 @@ volumes:
   pgdata:
   redisdata:
   cv_files:
+  photo_files:
   transcript_files:
+  stt_cache:
 
 networks:
   hirelens:

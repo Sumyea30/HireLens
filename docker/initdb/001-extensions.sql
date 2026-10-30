@@ -1,0 +1,2 @@
+-- Runs once, when the Postgres data volume is first created.
+CREATE EXTENSION IF NOT EXISTS vector;

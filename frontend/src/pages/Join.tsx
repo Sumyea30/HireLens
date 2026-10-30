@@ -35,11 +35,11 @@ export default function Join() {
       <div className="consent">
         <div className="brand"><span className="logo" aria-hidden /> <strong>HireLens</strong></div>
         <h1>Join your interview</h1>
-        <p className="muted">Before you join, please read how your interview is handled.</p>
+        <p className="muted">The room opens 5 minutes before the scheduled time. You can still join up to 10 minutes after it starts. Before you join, please read how your interview is handled.</p>
         <div className="card stack">
           <ul className="list">
             <li>Your camera and microphone are used for the live video call.</li>
-            <li>Your speech is converted to text during the call, with each speaker labelled. The audio and video are not kept after the transcript is made.</li>
+            <li>Your speech is transcribed on our servers for the hiring team only. You will not see the transcript. Audio and video are not kept after the text is made.</li>
             <li>The transcript and an AI-assisted assessment are reviewed by people. AI does not make the hiring decision.</li>
             <li>You can ask the employer to delete your data.</li>
           </ul>

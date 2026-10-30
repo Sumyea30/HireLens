@@ -11,7 +11,8 @@ def _shown(score) -> str:
 
 
 def _name(candidate: dict) -> str:
-    return candidate.get("name") or f"Applicant {candidate['id'][-4:].upper()}"
+    from app.api.pii import display_name
+    return display_name(candidate, reveal=False)
 
 
 def explain_candidate(name: str, score, matches: list[dict]) -> str:

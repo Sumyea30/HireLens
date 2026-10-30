@@ -3,16 +3,23 @@
 Which job? The job code (job-xxxxxxxx) in the subject, or in a plus-address such as hiring+job-xxxxxxxx@...
 The published job post tells applicants to put it in the subject.
 One CV per email: the first valid attachment is used. The body is never read for content or stored.
+
+Replies to incompleteness requests (subject token [HL-...] or In-Reply-To) replace the CV
+for that candidate instead of creating a new application.
 """
 import contextlib
 import hashlib
 import imaplib
 import logging
 import re
+import threading
+import time
 from dataclasses import dataclass
 from email import policy
 from email.parser import BytesParser
 from email.utils import parseaddr
+
+from app.services.completion import find_completion_token
 
 log = logging.getLogger("hirelens.mail")
 JOB_CODE = re.compile(r"\bjob-[a-z0-9]{4,32}\b", re.IGNORECASE)
@@ -22,9 +29,12 @@ MAX_ATTACHMENTS_SCANNED = 5
 @dataclass
 class ParsedEmail:
     message_id_hash: str
+    message_id: str
     subject: str
     recipients: str
     sender: str | None
+    in_reply_to: str
+    references: str
     attachments: list[tuple[str, bytes]]
 
 
@@ -41,7 +51,10 @@ def parse_email(raw: bytes) -> ParsedEmail:
             attachments.append((part.get_filename() or "", data))
         if len(attachments) >= MAX_ATTACHMENTS_SCANNED:
             break
-    return ParsedEmail(digest, str(msg["Subject"] or ""), recipients, sender, attachments)
+    return ParsedEmail(
+        digest, mid, str(msg["Subject"] or ""), recipients, sender,
+        str(msg["In-Reply-To"] or ""), str(msg["References"] or ""), attachments,
+    )
 
 
 def find_job_code(subject: str, recipients: str) -> str | None:
@@ -62,10 +75,36 @@ class MailProcessor:
         log.info("email_rejected", extra={"reason": reason})
         return {"outcome": "rejected", "reason": reason}
 
+    def _find_incomplete(self, p: ParsedEmail):
+        token = find_completion_token(p.subject)
+        if token:
+            found = self.store.get_candidate_by_completion_token(token)
+            if found and found.get("status") == "incomplete":
+                return found
+        for header in (p.in_reply_to, p.references):
+            found = self.store.get_candidate_by_completion_thread(header)
+            if found and found.get("status") == "incomplete":
+                return found
+        return None
+
     def process(self, raw: bytes) -> dict:
         p = parse_email(raw)
         if self.store.application_seen(p.message_id_hash):
             return {"outcome": "duplicate"}
+
+        incomplete = self._find_incomplete(p)
+        if incomplete:
+            for filename, data in p.attachments:
+                res = self.intake.replace_cv(
+                    candidate_id=incomplete["id"], filename=filename, data=data,
+                    sender_email=p.sender, message_id_hash=p.message_id_hash,
+                )
+                if res["status"] in ("queued", "incomplete"):
+                    return {"outcome": "accepted", "candidate_id": res["candidate_id"], "status": res["status"]}
+                if res["reason"] == "This email was already processed.":
+                    return {"outcome": "duplicate"}
+            return self._reject(p, incomplete.get("job_id"), "no_valid_attachment")
+
         code = find_job_code(p.subject, p.recipients)
         if not code:
             return self._reject(p, None, "no_job_code")
@@ -75,10 +114,12 @@ class MailProcessor:
         if job["status"] != "open":
             return self._reject(p, job["id"], "job_not_open")
         for filename, data in p.attachments:           # one CV per email: the first valid one wins
-            res = self.intake.accept(job_id=job["id"], filename=filename, data=data, source="email",
-                                     sender_email=p.sender, message_id_hash=p.message_id_hash)
-            if res["status"] == "queued":
-                return {"outcome": "accepted", "candidate_id": res["candidate_id"]}
+            res = self.intake.accept(
+                job_id=job["id"], filename=filename, data=data, source="email",
+                message_id_hash=p.message_id_hash, sender_email=p.sender,
+            )
+            if res["status"] in ("queued", "incomplete"):
+                return {"outcome": "accepted", "candidate_id": res["candidate_id"], "status": res["status"]}
             if res["reason"] == "This email was already processed.":
                 return {"outcome": "duplicate"}
         return self._reject(p, job["id"], "no_valid_attachment")
@@ -132,3 +173,31 @@ def poll_once(mailbox, processor: MailProcessor, limit: int = 25) -> dict:
                 counts["error"] += 1
                 log.error("email_failed", extra={"error_type": type(exc).__name__})
     return counts
+
+
+# Staff page refresh can hit this often; skip if we just polled.
+_CHECK_GAP_S = 15.0
+_check_lock = threading.Lock()
+_last_check_at = 0.0
+
+
+def check_inbox(settings, intake, store, *, force: bool = False) -> dict:
+    """One IMAP poll for the API (Candidates / Dashboard refresh). Safe if mail-ingest is also running."""
+    global _last_check_at
+    if not getattr(settings, "imap_configured", False):
+        return {"ok": False, "skipped": "not_configured", "counts": {}}
+    with _check_lock:
+        now = time.monotonic()
+        if not force and (now - _last_check_at) < _CHECK_GAP_S:
+            return {"ok": True, "skipped": "recent", "counts": {}}
+        _last_check_at = now
+    mailbox = ImapMailbox(
+        settings.imap_host, settings.imap_port, settings.imap_user, settings.imap_password, settings.imap_folder,
+    )
+    processor = MailProcessor(intake, store)
+    try:
+        counts = poll_once(mailbox, processor)
+        return {"ok": True, "skipped": None, "counts": counts}
+    except Exception as exc:
+        log.error("mail_check_failed", extra={"error_type": type(exc).__name__})
+        return {"ok": False, "skipped": None, "error": type(exc).__name__, "counts": {}}

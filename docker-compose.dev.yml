@@ -1,0 +1,7 @@
+# For running the backend and frontend directly on your computer while Postgres runs in Docker:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d db
+# Publishes Postgres on localhost only (127.0.0.1), never on your network.
+services:
+  db:
+    ports:
+      - "127.0.0.1:5432:5432"

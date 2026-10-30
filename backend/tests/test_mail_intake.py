@@ -4,14 +4,15 @@ import uuid
 from email.message import EmailMessage
 from unittest.mock import MagicMock, patch
 
-from app.services.intake import CVStorage, IntakeService
 from app.services.mail import ImapMailbox, MailProcessor, find_job_code, parse_email, poll_once
 from app.services.memory_store import MemoryStore
-from tests.helpers_f2 import PDF, make_docx, open_job
+from tests.helpers_f2 import PDF, make_cv_docx, make_docx, open_job, wired_intake
 
 
-def email(subject="Application job-abc12345", attachments=(("cv.pdf", PDF),), to="hiring@example.com",
+def email(subject="Application job-abc12345", attachments=None, to="hiring@example.com",
           msgid=None, sender="Jane Doe <Jane@Example.org>", body="Hello, my CV is attached. SECRET-BODY-TEXT"):
+    if attachments is None:
+        attachments = (("cv.docx", make_cv_docx()),)
     m = EmailMessage()
     m["Subject"], m["From"], m["To"] = subject, sender, to
     m["Message-ID"] = msgid or f"<{uuid.uuid4().hex}@mail.example>"
@@ -24,7 +25,7 @@ def email(subject="Application job-abc12345", attachments=(("cv.pdf", PDF),), to
 def setup(tmp_path, job_open=True):
     store = MemoryStore()
     open_job(store) if job_open else store.create_job("job-abc12345")
-    intake = IntakeService(store, CVStorage(str(tmp_path / "cvs")), 10)
+    intake, _, _ = wired_intake(tmp_path, store)
     return store, MailProcessor(intake, store), tmp_path / "cvs"
 
 
@@ -36,13 +37,16 @@ def test_job_code_in_subject_or_plus_address():
 
 def test_accepted_email_creates_a_candidate_and_stores_no_body(tmp_path):
     store, proc, cvdir = setup(tmp_path)
-    res = proc.process(email())
+    cv = make_cv_docx(name="Applicant Name", email="applicant@example.com")
+    res = proc.process(email(attachments=(("cv.docx", cv),), sender="Jane Doe <sender@example.org>"))
     assert res["outcome"] == "accepted"
     cand = store.get_candidate(res["candidate_id"])
-    assert cand["email"] == "jane@example.org" and cand["status"] == "queued" and cand["source"] == "email"
-    assert [p.name for p in cvdir.iterdir()] == [f"{res['candidate_id']}.pdf"]
-    stored = json.dumps([store.candidates, store.applications, store.audit], default=str)
-    assert "SECRET-BODY-TEXT" not in stored and "Jane Doe" not in stored                 # the body and display name are never kept
+    assert cand["email"] == "applicant@example.com" and cand["status"] == "queued" and cand["source"] == "email"
+    assert cand["name"] == "Applicant Name"
+    assert [p.name for p in cvdir.iterdir()] == [f"{res['candidate_id']}.docx"]
+    stored = json.dumps([store.applications, store.audit], default=str)
+    assert "SECRET-BODY-TEXT" not in stored
+    assert "sender@example.org" not in stored                                           # message sender is never kept as contact
 
 
 def test_same_email_twice_is_processed_once(tmp_path):
@@ -74,7 +78,7 @@ def test_closed_job_and_bad_attachments(tmp_path):
 
 def test_first_valid_attachment_wins_and_only_one_cv_per_email(tmp_path):
     store, proc, _ = setup(tmp_path)
-    res = proc.process(email(attachments=(("photo.exe", b"MZ"), ("cv.docx", make_docx()), ("cv2.pdf", PDF))))
+    res = proc.process(email(attachments=(("photo.exe", b"MZ"), ("cv.docx", make_cv_docx()), ("cv2.pdf", PDF))))
     assert res["outcome"] == "accepted" and len(store.candidates) == 1
     assert next(iter(store.candidates.values()))["file_path"].endswith(".docx")
 
@@ -109,6 +113,33 @@ def test_poll_marks_handled_mail_read_and_isolates_failures(tmp_path):
     assert counts == {"accepted": 2, "rejected": 1, "duplicate": 1, "error": 1}
     assert box.s.seen == ["1", "3", "4", "5"]                                            # the failed one stays unread for a retry
     assert len(store.candidates) == 2
+
+
+def test_check_inbox_skips_when_not_configured(tmp_path):
+    from types import SimpleNamespace
+    from app.services.mail import check_inbox
+    store, _proc, _ = setup(tmp_path)
+    settings = SimpleNamespace(imap_configured=False)
+    assert check_inbox(settings, None, store)["skipped"] == "not_configured"
+
+
+def test_check_inbox_debounces_rapid_calls(tmp_path):
+    from types import SimpleNamespace
+    from app.services import mail as mail_mod
+    store, proc, _ = setup(tmp_path)
+    settings = SimpleNamespace(
+        imap_configured=True, imap_host="imap.example.com", imap_port=993,
+        imap_user="u", imap_password="p", imap_folder="INBOX",
+    )
+    mail_mod._last_check_at = 0.0
+    with patch.object(mail_mod, "poll_once", return_value={"accepted": 1, "rejected": 0, "duplicate": 0, "error": 0}) as poll:
+        with patch.object(mail_mod, "ImapMailbox"):
+            with patch.object(mail_mod, "MailProcessor", return_value=proc):
+                first = mail_mod.check_inbox(settings, None, store)
+                second = mail_mod.check_inbox(settings, None, store)
+    assert first["ok"] and first["skipped"] is None and first["counts"]["accepted"] == 1
+    assert second["skipped"] == "recent"
+    assert poll.call_count == 1
 
 
 def test_imap_commands_use_peek_and_mark_seen_after_handling(tmp_path):

@@ -181,8 +181,42 @@ class MemoryStore:
             if application["message_id_hash"] in self.applications:
                 raise DuplicateApplication
             self.applications[application["message_id_hash"]] = {**application, "job_id": c["job_id"], "candidate_id": c["id"], "status": "accepted"}
-        self.candidates[c["id"]] = {"name": None, "email": None, "phone": None, "failure_reason": None, "aggregate_score": None,
-                                    "status": "queued", "received_at": now(), "file_path": None, **c}
+        self.candidates[c["id"]] = {
+            "name": None, "email": None, "phone": None, "failure_reason": None, "aggregate_score": None,
+            "status": "queued", "received_at": now(), "file_path": None, "photo_path": None,
+            "face_embedding": None, "completion_requests": 0, "completion_thread_id": None,
+            "completion_token": None, **c,
+        }
+
+    def update_candidate(self, cid: str, **fields) -> dict | None:
+        allowed = {
+            "name", "email", "phone", "status", "file_path", "photo_path", "face_embedding",
+            "completion_requests", "completion_thread_id", "completion_token", "failure_reason",
+            "aggregate_score",
+        }
+        c = self.candidates.get(cid)
+        if not c:
+            return None
+        for key, value in fields.items():
+            if key in allowed:
+                c[key] = value
+        return self.get_candidate(cid)
+
+    def get_candidate_by_completion_token(self, token: str) -> dict | None:
+        if not token:
+            return None
+        for c in self.candidates.values():
+            if c.get("completion_token") == token:
+                return self.get_candidate(c["id"])
+        return None
+
+    def get_candidate_by_completion_thread(self, message_id: str) -> dict | None:
+        if not message_id:
+            return None
+        for c in self.candidates.values():
+            if c.get("completion_thread_id") and c["completion_thread_id"] in message_id:
+                return self.get_candidate(c["id"])
+        return None
 
     def record_rejected_application(self, message_id_hash, job_id, reason) -> bool:
         if message_id_hash in self.applications:
@@ -192,6 +226,15 @@ class MemoryStore:
         return True
 
     def application_seen(self, message_id_hash): return message_id_hash in self.applications
+
+    def record_completion_reply(self, message_id_hash: str, job_id: str, candidate_id: str) -> bool:
+        """Mark a completeness-reply message as processed without creating a new candidate."""
+        if message_id_hash in self.applications:
+            return False
+        self.applications[message_id_hash] = {
+            "message_id_hash": message_id_hash, "job_id": job_id, "candidate_id": candidate_id, "status": "accepted",
+        }
+        return True
 
     def _cand_view(self, c):
         return {**{k: c[k] for k in ("id", "job_id", "name", "status", "aggregate_score", "source", "received_at")},
@@ -203,7 +246,17 @@ class MemoryStore:
 
     def get_candidate(self, cid):
         c = self.candidates.get(cid)
-        return {**self._cand_view(c), "email": c["email"], "phone": c["phone"], "failure_reason": c["failure_reason"]} if c else None
+        if not c:
+            return None
+        return {
+            **self._cand_view(c),
+            "email": c["email"], "phone": c["phone"], "failure_reason": c["failure_reason"],
+            "photo_path": c.get("photo_path"), "face_embedding": c.get("face_embedding"),
+            "completion_requests": c.get("completion_requests") or 0,
+            "completion_thread_id": c.get("completion_thread_id"),
+            "completion_token": c.get("completion_token"),
+            "file_path": c.get("file_path"),
+        }
 
     def claim_candidate(self, cid):
         """Move a queued (or interrupted) candidate to processing. Returns the file the graph should read."""
@@ -268,7 +321,7 @@ class MemoryStore:
             self.notes.pop(iid, None)
             self.qa.pop(iid, None)
         self.assessments = {k: v for k, v in self.assessments.items() if k[0] != cid}
-        return c["file_path"] or ""
+        return {"file_path": c.get("file_path") or "", "photo_path": c.get("photo_path") or ""}
 
     # ---- recruiter accounts ----------------------------------------------
     def create_recruiter(self, row: dict) -> dict:
@@ -296,6 +349,11 @@ class MemoryStore:
                                "entity": entity, "entity_id": entity_id, "outcome": outcome})
 
     def list_audit(self, limit=200): return list(reversed(self.audit))[:limit]
+
+    def count_audit_since(self, action: str, entity_id: str, since_iso: str) -> int:
+        with self._lock:
+            return sum(1 for e in self.audit
+                       if e["action"] == action and e["entity_id"] == entity_id and e["ts"] >= since_iso)
 
     def dashboard(self, owner_id=None):
         jobs = [j for j in self.jobs.values() if owner_id is None or j.get("owner_id") == owner_id]
@@ -399,6 +457,25 @@ class MemoryStore:
             doc["started_at"] = row.get("started_at")
             row["transcript"] = doc
             return copy.deepcopy(turn)
+
+    def edit_turn(self, interview_id: str, turn_id: str, text: str) -> dict | None:
+        from app.services.language_guard import apply_language_guard
+
+        with self._lock:
+            row = self.interviews.get(interview_id)
+            if not row or not row.get("transcript"):
+                return None
+            if row.get("status") == "completed":
+                return None
+            for turn in row["transcript"].get("turns") or []:
+                if turn.get("turn_id") == turn_id:
+                    if "original_text" not in turn:
+                        turn["original_text"] = turn.get("text") or ""
+                    turn["text"] = text
+                    turn["edited"] = True
+                    apply_language_guard(turn)
+                    return copy.deepcopy(turn)
+            return None
 
     def transcript_document(self, interview_id: str) -> dict | None:
         with self._lock:

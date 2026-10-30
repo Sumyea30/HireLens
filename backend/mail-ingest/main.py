@@ -9,7 +9,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core.config import load_settings
+from app.services.face import FaceService, build_face_engine
 from app.services.intake import CVStorage, IntakeService
+from app.services.photos import PhotoStorage
 from app.services.screening import make_on_queued
 from app.services.mail import ImapMailbox, MailProcessor, poll_once
 from app.services.pgstore import PgStore
@@ -34,7 +36,13 @@ def main() -> None:
             time.sleep(5)
         return
     store = PgStore(s.database_url, None, s.embedding_dims, s.apply_email)    # no embeddings needed here
-    processor = MailProcessor(IntakeService(store, CVStorage(s.cv_dir), s.max_upload_mb, on_queued=make_on_queued(s)), store)
+    photos = PhotoStorage(s.photo_dir)
+    face = FaceService(build_face_engine(s.face_provider), s.face_match_threshold)
+    intake = IntakeService(
+        store, CVStorage(s.cv_dir), s.max_upload_mb, on_queued=make_on_queued(s),
+        photos=photos, face=face, settings=s,
+    )
+    processor = MailProcessor(intake, store)
     mailbox = ImapMailbox(s.imap_host, s.imap_port, s.imap_user, s.imap_password, s.imap_folder)
     delay = s.mail_poll_seconds
     log.info("email intake started")

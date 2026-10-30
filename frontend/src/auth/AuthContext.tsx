@@ -74,9 +74,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     login, signup, joinWith, logout,
     can: (action) => {
       const r = session?.user.role;
-      if (action === "delete") return r === "admin";
+      if (action === "delete" || action === "view_logs") return r === "admin";
       if (action === "manage_policies") return r === "admin" || r === "interviewer";
-      return r === "admin" || r === "interviewer";
+      return false;
     },
   }), [session, login, signup, joinWith, logout]);
 

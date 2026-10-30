@@ -54,7 +54,7 @@ export default function Interviews() {
 
   return (
     <>
-      <PageHeader title="Interviews" subtitle="Schedule a time. The candidate and the interviewer are each emailed a room link and a calendar invitation." actions={<Button variant="primary" onClick={() => setOpen(true)}><Plus size={16} /> New interview</Button>} />
+      <PageHeader title="Interviews" subtitle="Schedule a time. The candidate gets a congratulations email with the job details and room link; the interviewer gets their own link. The candidate link opens 5 minutes early and stays open for 10 minutes after the start." actions={<Button variant="primary" onClick={() => setOpen(true)}><Plus size={16} /> New interview</Button>} />
       <Card>
         {loading ? <Spinner /> : error ? <ErrorState message={error} onRetry={reload} /> : !data?.length ? <EmptyState title="No interviews yet" text="Create one for a screened candidate." /> : (
           <div className="table-wrap"><table>
@@ -76,7 +76,7 @@ export default function Interviews() {
         <div className="field"><label htmlFor="ij">Job</label><select id="ij" value={jobId} onChange={(e) => { setJobId(e.target.value); setCandId(""); }}><option value="">Choose a job</option>{(jobs.data ?? []).filter((j) => j.status === "open").map((j) => <option key={j.id} value={j.id}>{j.title}</option>)}</select></div>
         <div className="field"><label htmlFor="ic">Candidate</label><select id="ic" value={candId} onChange={(e) => setCandId(e.target.value)} disabled={!jobId}><option value="">Choose a candidate</option>{eligible.map((c) => <option key={c.id} value={c.id}>{c.name} (score {c.aggregate_score})</option>)}</select></div>
         <div className="field"><label htmlFor="when">Date and time</label><input id="when" type="datetime-local" value={when} onChange={(e) => setWhen(e.target.value)} /></div>
-        <p className="muted small">The candidate and the interviewer are each emailed their own room link, in plain text and HTML, with a calendar invitation. The interview lasts 60 minutes. If an email cannot be sent, the interview is still scheduled and the link stays here to copy.</p>
+        <p className="muted small">The candidate email congratulates them on selection, names the job they applied to, the application date, interview time, company, and recruiter. Both people also get a calendar invite. The candidate link opens 5 minutes before the start and can still be used up to 10 minutes late. The interview lasts 60 minutes. If an email cannot be sent, the interview is still scheduled and the link stays here to copy.</p>
       </Modal>
       <Modal open={!!moveId} title="Reschedule interview" onClose={() => setMoveId(null)}
         footer={<><Button onClick={() => setMoveId(null)}>Cancel</Button><Button variant="primary" disabled={!when} loading={busy === "move"} onClick={move}>Save and email</Button></>}>

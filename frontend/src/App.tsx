@@ -48,7 +48,9 @@ export default function App() {
           <Route path="assessments/:id" element={<Assessment />} />
           <Route path="compare" element={<Compare />} />
           <Route path="policies" element={<Policies />} />
-          <Route path="logs" element={<Logs />} />
+          <Route element={<RequireRole roles={["admin"]} />}>
+            <Route path="logs" element={<Logs />} />
+          </Route>
           <Route path="settings" element={<Settings />} />
         </Route>
       </Route>

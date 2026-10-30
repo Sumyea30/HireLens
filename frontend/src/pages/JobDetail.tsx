@@ -7,12 +7,12 @@ import { useToast } from "../components/Toast";
 import { useAsync } from "../hooks/useAsync";
 import { formatDay, normalizeWeights, titleCase } from "../lib/format";
 import { log } from "../lib/logger";
-import type { UploadResult } from "../lib/types";
+import type { FunnelLabel, FunnelReport, UploadResult } from "../lib/types";
 
 export default function JobDetail() {
   const { id = "" } = useParams();
   const { data: job, error, loading, reload } = useAsync(() => api.getJob(id), [id]);
-  const [tab, setTab] = useState<"overview" | "weights" | "post" | "cvs">("overview");
+  const [tab, setTab] = useState<"overview" | "weights" | "post" | "cvs" | "funnel">("overview");
   if (loading) return <Spinner />;
   if (error || !job) return <ErrorState message={error ?? "Not found"} onRetry={reload} />;
   return (
@@ -20,13 +20,131 @@ export default function JobDetail() {
       <PageHeader title={job.title} subtitle={`Created ${formatDay(job.created_at)} · ${job.applicants} applicants`}
         actions={<><Badge tone={job.status === "open" ? "good" : "warn"}>{titleCase(job.status)}</Badge><Link className="btn" to={`/candidates?job=${job.id}`}>View candidates</Link></>} />
       <Card>
-        <Tabs tabs={[{ id: "overview", label: "Requirements" }, { id: "weights", label: "Scoring weights" }, { id: "post", label: "Job post" }, { id: "cvs", label: "Add CVs" }]} value={tab} onChange={setTab} />
+        <Tabs tabs={[
+          { id: "overview", label: "Requirements" },
+          { id: "weights", label: "Scoring weights" },
+          { id: "post", label: "Job post" },
+          { id: "funnel", label: "Funnel" },
+          { id: "cvs", label: "Add CVs" },
+        ]} value={tab} onChange={setTab} />
         {tab === "overview" && <Overview job={job} />}
         {tab === "weights" && <Weights jobId={job.id} initial={job.weights} onSaved={reload} />}
         {tab === "post" && (job.post_text ? <><pre className="log-line" style={{ fontFamily: "inherit" }}>{job.post_text}</pre><p className="muted small">Posted to: {job.channels.map(titleCase).join(", ") || "-"}. Applications: {job.apply_email}</p></> : <p className="muted">No post has been published for this job yet.</p>)}
+        {tab === "funnel" && <FunnelTab jobId={job.id} />}
         {tab === "cvs" && <Upload_ jobId={job.id} onDone={reload} />}
       </Card>
     </>
+  );
+}
+
+function funnelLabelTone(label: FunnelLabel): "bad" | "warn" | "good" {
+  return label === "bottleneck" ? "bad" : label === "non_discriminating" ? "warn" : "good";
+}
+
+function StackedBar({ met, partial, unmet }: { met: number; partial: number; unmet: number }) {
+  const total = Math.max(1, met + partial + unmet);
+  return (
+    <div className="stack-bar" role="img" aria-label={`${met} met, ${partial} partial, ${unmet} unmet`}>
+      <span className="stack-seg stack-met" style={{ width: `${(met / total) * 100}%` }} />
+      <span className="stack-seg stack-partial" style={{ width: `${(partial / total) * 100}%` }} />
+      <span className="stack-seg stack-unmet" style={{ width: `${(unmet / total) * 100}%` }} />
+    </div>
+  );
+}
+
+function FunnelTab({ jobId }: { jobId: string }) {
+  const toast = useToast();
+  const { data, error, loading, reload } = useAsync(() => api.getFunnel(jobId), [jobId]);
+  const [busy, setBusy] = useState(false);
+  const [suggestion, setSuggestion] = useState<string | null>(null);
+  const suggest = async () => {
+    setBusy(true);
+    try {
+      const r = await api.suggestFunnelRevision(jobId);
+      setSuggestion(r.summary);
+      toast(r.fed_to_assistant ? "Revision drafted for approval in the job assistant." : "Suggestion ready. Open the job assistant to apply it.", "good");
+      if (r.fed_to_assistant) reload();
+    } catch (e) {
+      toast(errorMessage(e), "bad");
+    } finally {
+      setBusy(false);
+    }
+  };
+  if (loading) return <Spinner />;
+  if (error || !data) return <ErrorState message={error ?? "Not found"} onRetry={reload} />;
+  return <FunnelBody report={data} busy={busy} suggestion={suggestion} onSuggest={suggest} />;
+}
+
+function FunnelBody({ report, busy, suggestion, onSuggest }: {
+  report: FunnelReport; busy: boolean; suggestion: string | null; onSuggest(): void;
+}) {
+  return (
+    <div className="stack">
+      <p className="muted small">{report.coverage_note} Shortlist is the top {report.shortlist_n} by official score.</p>
+      {report.low_sample && (
+        <div className="error-box" role="status">
+          <strong>Low sample</strong>
+          <p>Only {report.candidate_count} scored candidate{report.candidate_count === 1 ? "" : "s"}. Funnel labels are less reliable below 10.</p>
+        </div>
+      )}
+      <div className="row between">
+        <strong>Requirements funnel</strong>
+        <div className="row" style={{ gap: 10 }}>
+          <span className="muted small"><span className="legend-dot stack-met" /> Met</span>
+          <span className="muted small"><span className="legend-dot stack-partial" /> Partial</span>
+          <span className="muted small"><span className="legend-dot stack-unmet" /> Unmet</span>
+        </div>
+      </div>
+      {report.requirements.length === 0 ? <p className="muted">No screening requirements yet.</p> : (
+        <ul className="list funnel-list">
+          {report.requirements.map((r) => (
+            <li key={r.requirement_id} className="funnel-row">
+              <div className="row between">
+                <span>{r.text} {r.mandatory ? <Badge tone="info">mandatory</Badge> : <Badge>preferred</Badge>}</span>
+                <Badge tone={funnelLabelTone(r.label)}>{titleCase(r.label.split("_").join(" "))}</Badge>
+              </div>
+              <StackedBar met={r.met} partial={r.partial} unmet={r.unmet} />
+              <p className="muted small">{r.met} met · {r.partial} partial · {r.unmet} unmet · pass rate {(r.pass_rate * 100).toFixed(0)}%</p>
+            </li>
+          ))}
+        </ul>
+      )}
+      <div>
+        <strong>What-if (preferred only)</strong>
+        <p className="muted small">If a preferred requirement were treated as met, how the coverage-based shortlist would change. Mandatory requirements are never offered for relaxation.</p>
+        {report.what_if.length === 0 ? <p className="muted">No preferred requirements to relax.</p> : (
+          <ul className="list">
+            {report.what_if.map((w) => (
+              <li key={w.requirement_id}>
+                <strong>{w.text}</strong> — shortlist size {w.shortlist_size}
+                {w.entering.length === 0 ? <span className="muted"> (no new entrants)</span> : (
+                  <ul>{w.entering.map((e) => <li key={e.id}><Link to={`/candidates/${e.id}`}>{e.name}</Link> <span className="muted small">est. coverage {(e.coverage_estimate * 100).toFixed(0)}%</span></li>)}</ul>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+      <div>
+        <strong>Near misses</strong>
+        <p className="muted small">Outside the shortlist, but would enter the coverage top {report.shortlist_n} if exactly one preferred requirement were relaxed.</p>
+        {report.near_miss.length === 0 ? <p className="muted">None right now.</p> : (
+          <ul className="list">
+            {report.near_miss.map((m) => (
+              <li key={`${m.candidate_id}-${m.requirement_id}`}>
+                <Link to={`/candidates/${m.candidate_id}`}>{m.name}</Link>
+                {" "}via <em>{m.requirement_text}</em>
+                {m.evidence_refs.length > 0 && <span className="muted small"> · refs {m.evidence_refs.join(", ")}</span>}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+      <div className="row" style={{ gap: 12, alignItems: "center" }}>
+        <Button variant="primary" loading={busy} onClick={onSuggest}>Suggest post revision</Button>
+        {suggestion && <span className="muted small">{suggestion}</span>}
+      </div>
+    </div>
   );
 }
 

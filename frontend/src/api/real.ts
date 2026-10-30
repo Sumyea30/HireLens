@@ -13,10 +13,13 @@ export const realApi: Api = {
   listJobs: () => request("GET", "/jobs"),
   getJob: (id) => request("GET", `/jobs/${enc(id)}`),
   updateWeights: (id, weights) => request("PUT", `/jobs/${enc(id)}/weights`, { weights }),
+  getFunnel: (jobId) => request("GET", `/jobs/${enc(jobId)}/funnel`),
+  suggestFunnelRevision: (jobId) => request("POST", `/jobs/${enc(jobId)}/funnel/suggest-revision`),
   assistantMessage: (jobId, message, template) => request("POST", "/jobs/assistant", { job_id: jobId, message, template: template ?? null }),
   getAssistant: (jobId) => request("GET", `/jobs/${enc(jobId)}/assistant`),
   submitApproval: (jobId, decision) => request("POST", `/jobs/${enc(jobId)}/approval`, decision),
 
+  checkMail: () => request("POST", "/mail/check"),
   listCandidates: (jobId) => request("GET", jobId ? `/candidates?job_id=${enc(jobId)}` : "/candidates"),
   getCandidate: (id) => request("GET", `/candidates/${enc(id)}`),
   // One request per file: a request over the proxy's size limit then only rejects that one file,
@@ -48,7 +51,13 @@ export const realApi: Api = {
   rescheduleInterview: (id, startsAt) => request("POST", `/interviews/${enc(id)}/reschedule`, { starts_at: startsAt }),
   endInterview: (id) => request("POST", `/interviews/${enc(id)}/end`),
   getTranscript: (id) => request("GET", `/interviews/${enc(id)}/transcript`),
+  editTranscriptTurn: (id, turnId, text) => request("PATCH", `/interviews/${enc(id)}/transcript/turns/${enc(turnId)}`, { text }),
   getBrief: (id) => request("GET", `/interviews/${enc(id)}/brief`),
+  faceCheck: async (id, image) => {
+    const form = new FormData();
+    form.append("image", image, "frame.jpg");
+    return request("POST", `/interviews/${enc(id)}/face-check`, undefined, form);
+  },
   copilotQuota: (id) => request("GET", `/interviews/${enc(id)}/copilot`),
   askCopilot: (id, message) => request("POST", `/interviews/${enc(id)}/copilot`, { message }),
   getNotes: (id) => request("GET", `/interviews/${enc(id)}/notes`),

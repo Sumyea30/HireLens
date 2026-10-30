@@ -205,14 +205,62 @@ class PgStore:
     def create_candidate(self, c_, application=None):
         """Atomic: the candidate and its application record are saved together or not at all."""
         with self._conn() as c, c.transaction():
-            c.execute("INSERT INTO candidate (id, job_id, email, status, source, file_path) VALUES (%s,%s,%s,'queued',%s,%s)",
-                      (c_["id"], c_["job_id"], c_.get("email"), c_["source"], c_.get("file_path")))
+            c.execute(
+                "INSERT INTO candidate (id, job_id, name, email, status, source, file_path, photo_path, "
+                "face_embedding, completion_requests, completion_thread_id, completion_token) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s)",
+                (c_["id"], c_["job_id"], c_.get("name"), c_.get("email"), c_.get("status") or "queued",
+                 c_["source"], c_.get("file_path"), c_.get("photo_path"),
+                 json.dumps(c_.get("face_embedding")) if c_.get("face_embedding") is not None else None,
+                 int(c_.get("completion_requests") or 0), c_.get("completion_thread_id"),
+                 c_.get("completion_token")),
+            )
             if application:
                 row = c.execute("INSERT INTO application (job_id, candidate_id, message_id_hash, status) VALUES (%s,%s,%s,'accepted') "
                                 "ON CONFLICT (message_id_hash) DO NOTHING RETURNING id",
                                 (c_["job_id"], c_["id"], application["message_id_hash"])).fetchone()
                 if not row:
                     raise DuplicateApplication      # leaving the block rolls the candidate back
+
+    def update_candidate(self, cid: str, **fields) -> dict | None:
+        allowed = {
+            "name", "email", "phone", "status", "file_path", "photo_path", "face_embedding",
+            "completion_requests", "completion_thread_id", "completion_token", "failure_reason",
+            "aggregate_score",
+        }
+        sets, args = [], []
+        for key, value in fields.items():
+            if key not in allowed:
+                continue
+            if key == "face_embedding":
+                sets.append("face_embedding = %s::jsonb")
+                args.append(json.dumps(value) if value is not None else None)
+            else:
+                sets.append(f"{key} = %s")
+                args.append(value)
+        if not sets:
+            return self.get_candidate(cid)
+        args.append(cid)
+        with self._conn() as c:
+            c.execute(f"UPDATE candidate SET {', '.join(sets)} WHERE id = %s", args)
+        return self.get_candidate(cid)
+
+    def get_candidate_by_completion_token(self, token: str) -> dict | None:
+        if not token:
+            return None
+        with self._conn() as c:
+            r = c.execute(f"{self._CAND} WHERE c.completion_token = %s", (token,)).fetchone()
+        return _iso(r, "received_at") if r else None
+
+    def get_candidate_by_completion_thread(self, message_id: str) -> dict | None:
+        if not message_id:
+            return None
+        with self._conn() as c:
+            r = c.execute(
+                f"{self._CAND} WHERE c.completion_thread_id IS NOT NULL AND %s LIKE '%%' || c.completion_thread_id || '%%'",
+                (message_id,),
+            ).fetchone()
+        return _iso(r, "received_at") if r else None
 
     def record_rejected_application(self, message_id_hash, job_id, reason) -> bool:
         with self._conn() as c:
@@ -224,8 +272,21 @@ class PgStore:
         with self._conn() as c:
             return bool(c.execute("SELECT 1 FROM application WHERE message_id_hash = %s", (message_id_hash,)).fetchone())
 
-    _CAND = ("SELECT c.id, c.job_id, c.name, c.status, c.aggregate_score::float AS aggregate_score, c.source, c.received_at, "
-             "a.id AS assessment_id, c.email, c.phone, c.failure_reason FROM candidate c LEFT JOIN assessment a ON a.candidate_id = c.id")
+    def record_completion_reply(self, message_id_hash: str, job_id: str, candidate_id: str) -> bool:
+        with self._conn() as c:
+            row = c.execute(
+                "INSERT INTO application (job_id, candidate_id, message_id_hash, status) VALUES (%s,%s,%s,'accepted') "
+                "ON CONFLICT (message_id_hash) DO NOTHING RETURNING id",
+                (job_id, candidate_id, message_id_hash),
+            ).fetchone()
+        return bool(row)
+
+    _CAND = (
+        "SELECT c.id, c.job_id, c.name, c.status, c.aggregate_score::float AS aggregate_score, c.source, c.received_at, "
+        "a.id AS assessment_id, c.email, c.phone, c.failure_reason, c.file_path, c.photo_path, c.face_embedding, "
+        "c.completion_requests, c.completion_thread_id, c.completion_token "
+        "FROM candidate c LEFT JOIN assessment a ON a.candidate_id = c.id"
+    )
 
     def list_candidates(self, job_id=None):
         where, args = ("WHERE c.job_id = %s", (job_id,)) if job_id else ("", ())
@@ -236,7 +297,13 @@ class PgStore:
     def get_candidate(self, cid):
         with self._conn() as c:
             r = c.execute(f"{self._CAND} WHERE c.id = %s", (cid,)).fetchone()
-        return _iso(r, "received_at") if r else None
+        if not r:
+            return None
+        row = _iso(r, "received_at")
+        emb = row.get("face_embedding")
+        if isinstance(emb, str):
+            row["face_embedding"] = json.loads(emb)
+        return row
 
     def claim_candidate(self, cid):
         """Move a queued (or interrupted) candidate to processing. Returns the file the graph should read."""
@@ -326,16 +393,16 @@ class PgStore:
                       (content_hash, rubric_key, json.dumps(result)))
 
     def delete_candidate(self, cid):
-        """Delete the candidate; every dependent row goes with it (ON DELETE CASCADE). Returns the CV file path to remove."""
+        """Delete the candidate; every dependent row goes with it (ON DELETE CASCADE). Returns paths to remove."""
         with self._conn() as c, c.transaction():
-            r = c.execute("SELECT file_path FROM candidate WHERE id = %s", (cid,)).fetchone()
+            r = c.execute("SELECT file_path, photo_path FROM candidate WHERE id = %s", (cid,)).fetchone()
             if not r:
                 return None
             files = c.execute("SELECT transcript_file FROM interview_session WHERE candidate_id = %s", (cid,)).fetchall()
             c.execute("DELETE FROM candidate WHERE id = %s", (cid,))
         for row in files:
             _remove_file(row["transcript_file"])
-        return r["file_path"] or ""
+        return {"file_path": r["file_path"] or "", "photo_path": r["photo_path"] or ""}
 
     def get_recruiter(self, user_id: str) -> dict | None:
         with self._conn() as c:
@@ -368,6 +435,14 @@ class PgStore:
             rows = c.execute("SELECT id::text AS id, ts, actor_role, action, entity, entity_id, outcome FROM audit_event "
                              "ORDER BY ts DESC, id DESC LIMIT %s", (limit,)).fetchall()
         return [_iso(r, "ts") for r in rows]
+
+    def count_audit_since(self, action: str, entity_id: str, since_iso: str) -> int:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT count(*) AS n FROM audit_event WHERE action = %s AND entity_id = %s AND ts >= %s::timestamptz",
+                (action, entity_id, since_iso),
+            ).fetchone()
+        return int(row["n"] if row else 0)
 
     def dashboard(self, owner_id=None):
         with self._conn() as c:
@@ -476,6 +551,34 @@ class PgStore:
             doc["turns"].append(turn)
             c.execute("UPDATE interview_session SET transcript = %s::jsonb WHERE id = %s", (json.dumps(doc), interview_id))
         return turn
+
+    def edit_turn(self, interview_id: str, turn_id: str, text: str) -> dict | None:
+        from app.services.language_guard import apply_language_guard
+
+        with self._conn() as c, c.transaction():
+            row = c.execute(
+                "SELECT status, transcript FROM interview_session WHERE id = %s FOR UPDATE", (interview_id,)).fetchone()
+            if not row or row["status"] == "completed":
+                return None
+            doc = row["transcript"] if isinstance(row["transcript"], dict) else None
+            if doc is None and isinstance(row["transcript"], str):
+                doc = json.loads(row["transcript"])
+            if not doc:
+                return None
+            found = None
+            for turn in doc.get("turns") or []:
+                if turn.get("turn_id") == turn_id:
+                    if "original_text" not in turn:
+                        turn["original_text"] = turn.get("text") or ""
+                    turn["text"] = text
+                    turn["edited"] = True
+                    apply_language_guard(turn)
+                    found = turn
+                    break
+            if not found:
+                return None
+            c.execute("UPDATE interview_session SET transcript = %s::jsonb WHERE id = %s", (json.dumps(doc), interview_id))
+            return dict(found)
 
     def transcript_document(self, interview_id: str) -> dict | None:
         with self._conn() as c:

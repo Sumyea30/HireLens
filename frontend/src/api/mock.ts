@@ -2,7 +2,7 @@
 import { getSession } from "../auth/session";
 import type {
   ApprovalDecision, Assessment, AssistantReply, AuditEvent, Candidate, CopilotReply, CvBatchResult, CvReview,
-  InterviewNote, JobProfile, Policy, RequirementMatch, Role, UploadResult,
+  FunnelReport, InterviewNote, JobProfile, Policy, RequirementMatch, Role, UploadResult,
 } from "../lib/types";
 import { ApiError, MAX_UPLOAD_MB } from "./client";
 import type { Api } from "./contract";
@@ -67,6 +67,88 @@ function explainCv(name: string, score: number, matches: RequirementMatch[]): st
     clause(partial, "Partially met"),
     clause(unmet, "Not met"),
   ].filter(Boolean).join(" ");
+}
+
+const FUNNEL_SHORTLIST_N = 5;
+const FUNNEL_BOTTLENECK_MAX = 0.2;
+const FUNNEL_FLAT_MIN = 0.9;
+const STATUS_VAL = { met: 1, partial: 0.5, unmet: 0 } as const;
+
+function mockFunnel(jobId: string): FunnelReport {
+  const job = db.jobs.find((j) => j.id === jobId);
+  if (!job) throw new ApiError(404, "We could not find what you asked for.");
+  const reqs = job.requirements.length ? job.requirements : REQUIREMENTS;
+  const scored = db.candidates
+    .filter((c) => c.job_id === jobId && c.aggregate_score != null && c.status !== "failed")
+    .map((c) => {
+      const matches = buildMatches(c.id, c.aggregate_score ?? 0, reqs);
+      const coverage = matches.length
+        ? matches.reduce((s, m) => s + STATUS_VAL[m.status], 0) / matches.length
+        : 0;
+      return { id: c.id, name: c.name, aggregate_score: c.aggregate_score ?? 0, coverage_estimate: Math.round(coverage * 10000) / 10000, matches };
+    })
+    .sort((a, b) => b.aggregate_score - a.aggregate_score || a.id.localeCompare(b.id));
+  const shortlistIds = new Set(scored.slice(0, FUNNEL_SHORTLIST_N).map((c) => c.id));
+  const n = scored.length;
+  const requirements = reqs.map((r) => {
+    const counts = { met: 0, partial: 0, unmet: 0 };
+    for (const c of scored) {
+      const st = c.matches.find((m) => m.requirement_id === r.id)?.status ?? "unmet";
+      counts[st] += 1;
+    }
+    const pass_rate = n ? counts.met / n : 0;
+    const label = pass_rate < FUNNEL_BOTTLENECK_MAX ? "bottleneck" : pass_rate > FUNNEL_FLAT_MIN ? "non_discriminating" : "balanced";
+    return {
+      requirement_id: r.id, text: r.text, kind: r.kind, mandatory: r.kind === "required",
+      met: counts.met, partial: counts.partial, unmet: counts.unmet,
+      pass_rate: Math.round(pass_rate * 10000) / 10000, label: label as FunnelReport["requirements"][0]["label"],
+    };
+  });
+  const what_if = reqs.filter((r) => r.kind === "preferred").map((r) => {
+    const flipped = scored.map((c) => {
+      const statuses = reqs.map((q) => (q.id === r.id ? "met" as const : (c.matches.find((m) => m.requirement_id === q.id)?.status ?? "unmet")));
+      const coverage = statuses.reduce((s, st) => s + STATUS_VAL[st], 0) / Math.max(1, statuses.length);
+      return { ...c, coverage_estimate: Math.round(coverage * 10000) / 10000 };
+    }).sort((a, b) => b.coverage_estimate - a.coverage_estimate || b.aggregate_score - a.aggregate_score || a.id.localeCompare(b.id));
+    const alt = flipped.slice(0, FUNNEL_SHORTLIST_N);
+    return {
+      requirement_id: r.id, text: r.text, shortlist_size: alt.length,
+      entering: alt.filter((c) => !shortlistIds.has(c.id)).map((c) => ({ id: c.id, name: c.name, coverage_estimate: c.coverage_estimate })),
+    };
+  });
+  const preferred = reqs.filter((r) => r.kind === "preferred");
+  const near_miss = scored.filter((c) => !shortlistIds.has(c.id)).flatMap((c) => {
+    const workable = preferred.filter((r) => {
+      const st = c.matches.find((m) => m.requirement_id === r.id)?.status ?? "unmet";
+      if (st === "met") return false;
+      const flipped = scored.map((row) => {
+        const statuses = reqs.map((q) => {
+          if (row.id === c.id && q.id === r.id) return "met" as const;
+          return row.matches.find((m) => m.requirement_id === q.id)?.status ?? "unmet";
+        });
+        const coverage = statuses.reduce((s, x) => s + STATUS_VAL[x], 0) / Math.max(1, statuses.length);
+        return { id: row.id, coverage_estimate: coverage, aggregate_score: row.aggregate_score };
+      }).sort((a, b) => b.coverage_estimate - a.coverage_estimate || b.aggregate_score - a.aggregate_score || a.id.localeCompare(b.id));
+      return flipped.slice(0, FUNNEL_SHORTLIST_N).some((x) => x.id === c.id);
+    });
+    if (workable.length !== 1) return [];
+    const r = workable[0];
+    const match = c.matches.find((m) => m.requirement_id === r.id);
+    return [{
+      candidate_id: c.id, name: c.name, requirement_id: r.id, requirement_text: r.text,
+      evidence_refs: (match?.evidence ?? []).map((e) => e.ref),
+      coverage_estimate: c.coverage_estimate, aggregate_score: c.aggregate_score,
+    }];
+  });
+  return {
+    job_id: jobId, job_title: job.title, candidate_count: n, low_sample: n < 10,
+    shortlist_n: FUNNEL_SHORTLIST_N,
+    shortlist: scored.filter((c) => shortlistIds.has(c.id)).map(({ id, name, aggregate_score, coverage_estimate }) => ({ id, name, aggregate_score, coverage_estimate })),
+    candidates: scored.map((c) => ({ id: c.id, name: c.name, aggregate_score: c.aggregate_score, coverage_estimate: c.coverage_estimate, in_shortlist: shortlistIds.has(c.id) })),
+    requirements, what_if, near_miss,
+    thresholds: { bottleneck_max: FUNNEL_BOTTLENECK_MAX, flat_min: FUNNEL_FLAT_MIN, shortlist_n: FUNNEL_SHORTLIST_N },
+    coverage_note: "Coverage is an estimate (met=1, partial=0.5, unmet=0). It is never the official score.",
+  };
 }
 
 function reviewFor(jobId: string): CvReview {
@@ -336,7 +418,19 @@ export const mockApi: Api = {
     await delay();
     if (!consent) throw new ApiError(400, "Please accept the notice to join the interview.");
     const it = db.interviews.find((i) => i.join_token === joinToken);
-    if (!it) throw new ApiError(404, "This interview link is not valid.");
+    if (!it || it.status === "completed") throw new ApiError(404, "This interview link is not valid.");
+    if (it.status !== "live" && it.scheduled_at) {
+      const start = new Date(it.scheduled_at).getTime();
+      const now = Date.now();
+      const earlyMs = 5 * 60_000;
+      const lateMs = 10 * 60_000;
+      if (now < start - earlyMs) {
+        throw new ApiError(403, "This interview room opens 5 minutes before the scheduled time. Please try again closer to then.");
+      }
+      if (now > start + lateMs) {
+        throw new ApiError(403, "This interview link closed 10 minutes after the scheduled start. Please contact the recruiter if you still need to join.");
+      }
+    }
     return { token: `mock-room-${it.id}`, user: { id: "room-guest", name: it.candidate_name, role: "candidate" }, interview_id: it.id };
   },
 
@@ -378,6 +472,35 @@ export const mockApi: Api = {
     j.weights = weights;
     audit("weights_updated", "job", id);
     return j;
+  },
+
+  async getFunnel(jobId) {
+    await delay();
+    const report = mockFunnel(jobId);
+    audit("funnel_viewed", "job", jobId);
+    return report;
+  },
+  async suggestFunnelRevision(jobId) {
+    await delay(400);
+    if (!db.jobs.some((j) => j.id === jobId)) throw new ApiError(404, "We could not find what you asked for.");
+    const used = db.audit.filter((e) => e.action === "funnel_suggest" && e.entity_id === jobId).length;
+    if (used >= 3) throw new ApiError(429, "At most 3 revision suggestions per job per day.");
+    audit("funnel_suggest", "job", jobId);
+    const feedback = "Funnel Doctor (demo): clarify preferred skills that few candidates meet, and keep mandatory criteria unchanged.";
+    const st = ensureAssistant(jobId);
+    st.status = "awaiting_approval";
+    st.approval = approvalFor(st.profile);
+    st.approval.draft_post += `\n\n(Revised after Funnel Doctor feedback: ${feedback})`;
+    st.messages.push({ role: "assistant", content: "I prepared a revised draft from the funnel suggestion. Please review it." });
+    const job = db.jobs.find((j) => j.id === jobId)!;
+    if (job.status !== "open") job.status = "awaiting_approval";
+    audit("funnel_suggest_fed", "job", jobId);
+    return {
+      summary: "Demo suggestion: soften over-selective preferred wording.",
+      feedback,
+      assistant: structuredClone(st),
+      fed_to_assistant: true,
+    };
   },
 
   async assistantMessage(jobId, message, template) {
@@ -444,6 +567,7 @@ export const mockApi: Api = {
     return structuredClone(st);
   },
 
+  async checkMail() { await delay(50); return { ok: true, skipped: "mock", counts: {} }; },
   async listCandidates(jobId) { await delay(); return db.candidates.filter((c) => !jobId || c.job_id === jobId).map((c) => ({ ...c })); },
   async getCandidate(id) {
     await delay();
@@ -553,6 +677,19 @@ export const mockApi: Api = {
     await delay();
     const i = db.interviews.find((x) => x.id === id);
     return { interview_id: id, candidate_id: i?.candidate_id ?? "", job_id: i?.job_id ?? "", started_at: i?.started_at ?? null, ended_at: i?.ended_at ?? null, turns: TRANSCRIPT };
+  },
+  async editTranscriptTurn(id, turnId, text) {
+    await delay();
+    const turn = TRANSCRIPT.find((t) => t.turn_id === turnId);
+    if (!turn) throw new ApiError(404, "We could not find what you asked for.");
+    if (!turn.original_text) turn.original_text = turn.text;
+    turn.text = text;
+    turn.edited = true;
+    return { ...turn };
+  },
+  async faceCheck(_id, _image) {
+    await delay();
+    return { match: true, score: 0.91, reason: "ok" };
   },
   async getBrief(id) {
     await delay();

@@ -127,7 +127,7 @@ export function seedJobs(): Job[] {
 export function seedInterviews(): Interview[] {
   const mk = (id: string, c: string, name: string, status: Interview["status"], minutes: number): Interview => ({
     id, job_id: "job-1", job_title: "Backend Developer", candidate_id: c, candidate_name: name, status,
-    created_at: iso(minutes + 60), scheduled_at: iso(status === "scheduled" ? -1440 : minutes),
+    created_at: iso(minutes + 60), scheduled_at: iso(status === "scheduled" ? -2 : minutes),
     started_at: status === "scheduled" ? null : iso(minutes),
     ended_at: status === "completed" ? iso(minutes - 30) : null, join_token: `join-${id}-demo`,
   });

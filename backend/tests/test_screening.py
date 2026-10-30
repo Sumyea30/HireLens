@@ -8,13 +8,13 @@ from app.graphs import Deps, build_cv_graph, build_job_post_graph, memory_checkp
 from app.graphs.fakes import FakeLLM
 from app.main import Services, create_app
 from app.services.cvtext import extract_cv_text
-from app.services.intake import CVStorage, IntakeService
 from app.services.memory_store import MemoryStore
 from app.services.policy import PolicyService
 from app.services.screening import make_on_queued, screen_candidate
-from tests.helpers_f2 import PDF, make_docx, open_job, settings
+from tests.helpers_f2 import FACE_JPEG, PDF, make_cv_docx, make_docx, open_job, settings, wired_intake
 
 CV = (
+    "Jane Doe\n"
     "Email: jane@example.com\n"
     "Phone: +880 1700 000000\n"
     "Date of Birth: 1999-01-01\n"
@@ -26,6 +26,10 @@ CV = (
     "BSc in Computer Science. Shipped containerised Python services for production workloads "
     "and kept the Docker images small enough to deploy every week.\n"
 )
+
+def _cv_bytes(text=CV):
+    return make_docx(text, photo=FACE_JPEG)
+
 
 
 def _llm():
@@ -62,9 +66,11 @@ def make_client(tmp_path, llm=None, extract=extract_cv_text):
     store = MemoryStore("hiring@example.com")
     llm = llm or _llm()
     deps = Deps(llm=llm, store=store, repo=store, extract_text=extract, ocr_text=_no_ocr)
-    intake = IntakeService(store, CVStorage(str(tmp_path / "cvs")), 10, on_queued=make_on_queued(settings()))
-    svc = Services(settings(), store, deps, build_job_post_graph(deps, memory_checkpointer()), PolicyService(store), intake)
+    s = settings(photo_dir=str(tmp_path / "photos"))
+    intake, photos, face = wired_intake(tmp_path, store, on_queued=make_on_queued(s), settings_obj=s)
+    svc = Services(s, store, deps, build_job_post_graph(deps, memory_checkpointer()), PolicyService(store), intake)
     svc.cv_graph = build_cv_graph(deps)
+    svc.photos, svc.face = photos, face
     return TestClient(create_app(svc)), svc, llm
 
 
@@ -83,7 +89,7 @@ def test_upload_stays_queued_until_screening_fills_the_candidate(tmp_path):
     c, svc, _ = make_client(tmp_path)
     h = login(c)
     job = open_job(svc.store)
-    up = c.post(f"/jobs/{job}/cvs", headers=h, files=[("files", ("cv.docx", make_docx(CV), "application/zip"))])
+    up = c.post(f"/jobs/{job}/cvs", headers=h, files=[("files", ("cv.docx", _cv_bytes(), "application/zip"))])
     assert up.status_code == 200 and up.json()[0]["status"] == "queued"
     cid = c.get(f"/candidates?job_id={job}", headers=h).json()[0]["id"]
     queued = c.get(f"/candidates/{cid}", headers=h).json()
@@ -106,17 +112,19 @@ def test_upload_stays_queued_until_screening_fills_the_candidate(tmp_path):
     assert shown["ref"] == ref and "Python" in shown["text"] and "1999" not in shown["text"]
     assert c.get("/dashboard/summary", headers=h).json()["awaiting_screening"] == 0
     assert screen_candidate(svc, cid) == "skipped"
-    assert any(e["action"] == "cv_screened" and e["entity_id"] == cid for e in c.get("/audit", headers=h).json())
+    admin = {"Authorization": "Bearer " + c.post("/auth/login", json={"username": "ada", "password": "pw-ada"}).json()["token"]}
+    assert any(e["action"] == "cv_screened" and e["entity_id"] == cid for e in c.get("/audit", headers=admin).json())
 
 
-def test_sender_email_is_kept_when_the_cv_names_a_different_address(tmp_path):
+def test_email_is_taken_from_the_cv_not_the_message_sender(tmp_path):
     _c, svc, _ = make_client(tmp_path)
     job = open_job(svc.store)
-    res = svc.intake.accept(job_id=job, filename="cv.docx", data=make_docx(CV), source="email",
-                            sender_email="other@example.com", message_id_hash="hash-1")
+    res = svc.intake.accept(job_id=job, filename="cv.docx", data=_cv_bytes(), source="email",
+                            message_id_hash="hash-1", sender_email="other@example.com")
+    assert res["status"] == "queued"
     assert screen_candidate(svc, res["candidate_id"]) == "completed"
     cand = svc.store.get_candidate(res["candidate_id"])
-    assert cand["email"] == "other@example.com" and cand["phone"] is None
+    assert cand["email"] == "jane@example.com" and cand["phone"] is None and cand["name"] == "Jane Doe"
 
 
 def test_unreadable_cv_is_marked_failed_without_calling_the_model(tmp_path):
@@ -126,7 +134,7 @@ def test_unreadable_cv_is_marked_failed_without_calling_the_model(tmp_path):
     c, svc, llm = make_client(tmp_path, extract=boom)
     h = login(c)
     job = open_job(svc.store)
-    cid = c.post(f"/jobs/{job}/cvs", headers=h, files=[("files", ("a.pdf", PDF, "application/pdf"))]).json()
+    cid = c.post(f"/jobs/{job}/cvs", headers=h, files=[("files", ("a.docx", _cv_bytes(), "application/zip"))]).json()
     assert cid[0]["status"] == "queued"
     cand_id = c.get("/candidates", headers=h).json()[0]["id"]
     assert screen_candidate(svc, cand_id) == "failed" and llm.calls == []
@@ -139,7 +147,7 @@ def test_a_job_with_no_requirements_fails_screening(tmp_path):
     _c, svc, _ = make_client(tmp_path)
     svc.store.create_job("job-empty")
     svc.store.update_job("job-empty", status="open")
-    res = svc.intake.accept(job_id="job-empty", filename="cv.docx", data=make_docx(CV), source="upload")
+    res = svc.intake.accept(job_id="job-empty", filename="cv.docx", data=_cv_bytes(), source="upload")
     assert screen_candidate(svc, res["candidate_id"]) == "failed"
     assert svc.store.get_candidate(res["candidate_id"])["failure_reason"] == "Screening could not be completed."
 
@@ -148,7 +156,7 @@ def test_the_same_cv_keeps_its_score_and_the_review_explains_why(tmp_path):
     c, svc, llm = make_client(tmp_path)
     h = login(c)
     job = open_job(svc.store)
-    files = [("files", ("cv.docx", make_docx(CV), "application/zip"))]
+    files = [("files", ("cv.docx", _cv_bytes(), "application/zip"))]
     first = c.post(f"/jobs/{job}/cv-batch", headers=h, files=files)
     assert first.status_code == 200
     body = first.json()
@@ -189,8 +197,8 @@ def test_a_batch_scores_cvs_at_the_same_time(tmp_path, monkeypatch):
 
     monkeypatch.setattr(screening, "screen_candidate", together)
     files = [
-        ("files", ("a.docx", make_docx(CV), "application/zip")),
-        ("files", ("b.docx", make_docx(CV + "\n\nExtra project work on APIs."), "application/zip")),
+        ("files", ("a.docx", _cv_bytes(), "application/zip")),
+        ("files", ("b.docx", _cv_bytes(CV + "\n\nExtra project work on APIs."), "application/zip")),
     ]
     res = c.post(f"/jobs/{job}/cv-batch", headers=h, files=files)
     assert res.status_code == 200
@@ -201,7 +209,7 @@ def test_a_recruiter_cannot_score_cvs_for_someone_elses_job(tmp_path):
     c, svc, _ = make_client(tmp_path)
     job = open_job(svc.store)
     other = c.post("/auth/signup", json={"name": "Samira", "email": "samira@example.com", "password": "long-enough"}).json()["token"]
-    files = [("files", ("cv.docx", make_docx(CV), "application/zip"))]
+    files = [("files", ("cv.docx", _cv_bytes(), "application/zip"))]
     denied = c.post(f"/jobs/{job}/cv-batch", headers={"Authorization": "Bearer " + other}, files=files)
     assert denied.status_code == 404
     ada = c.post("/auth/login", json={"username": "ada", "password": "pw-ada"}).json()["token"]

@@ -13,6 +13,13 @@ def _int(name: str, default: int) -> int:
         return default
 
 
+def _float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
 @dataclass(frozen=True)
 class Settings:
     database_url: str = ""
@@ -31,7 +38,10 @@ class Settings:
     cors_origins: tuple[str, ...] = field(default_factory=tuple)
     # CV collection
     cv_dir: str = "stored_cvs"
+    photo_dir: str = "stored_photos"
     max_upload_mb: int = 10
+    face_match_threshold: float = 0.35
+    face_provider: str = "auto"  # auto | insightface | hash (tests / no model)
     imap_host: str = ""
     imap_port: int = 993
     imap_user: str = ""
@@ -59,6 +69,12 @@ class Settings:
     smtp_user: str = ""
     smtp_password: str = ""
     transcript_dir: str = ""             # optional git-ignored folder for a copy of the transcript JSON
+    stt_provider: str = "faster_whisper"  # assemblyai | faster_whisper | fake
+    stt_url: str = "http://127.0.0.1:8090"
+    stt_timeout_seconds: int = 90
+    assemblyai_api_key: str = ""
+    assemblyai_base_url: str = "https://api.assemblyai.com"
+    stt_language: str = "en"
     copilot_max_calls: int = 15
     copilot_input_tokens: int = 3000
     copilot_output_tokens: int = 600
@@ -67,6 +83,11 @@ class Settings:
     eval_max_runs: int = 2
     eval_input_tokens: int = 12_000
     eval_output_tokens: int = 2_000
+    # Funnel Doctor (F11) — estimate-only analytics; does not change official scores
+    funnel_bottleneck_max: float = 0.2
+    funnel_flat_min: float = 0.9
+    funnel_shortlist_n: int = 5
+    funnel_suggest_max_per_day: int = 3
 
     @property
     def imap_configured(self) -> bool:
@@ -110,7 +131,10 @@ def load_settings() -> Settings:
         users_json=os.environ.get("USERS_JSON", "{}"),
         cors_origins=tuple(o for o in os.environ.get("CORS_ORIGINS", "").split(",") if o),
         cv_dir=os.environ.get("CV_DIR", "stored_cvs"),
+        photo_dir=os.environ.get("PHOTO_DIR", "stored_photos"),
         max_upload_mb=_int("MAX_UPLOAD_MB", 10),
+        face_match_threshold=_float("FACE_MATCH_THRESHOLD", 0.35),
+        face_provider=os.environ.get("FACE_PROVIDER", "auto"),
         imap_host=os.environ.get("IMAP_HOST", ""),
         imap_port=_int("IMAP_PORT", 993),
         imap_user=os.environ.get("IMAP_USER", ""),
@@ -136,6 +160,12 @@ def load_settings() -> Settings:
         smtp_user=os.environ.get("SMTP_USER", ""),
         smtp_password=os.environ.get("SMTP_PASSWORD", ""),
         transcript_dir=os.environ.get("TRANSCRIPT_DIR", ""),
+        stt_provider=os.environ.get("STT_PROVIDER", "faster_whisper"),
+        stt_url=os.environ.get("STT_URL", "http://127.0.0.1:8090"),
+        stt_timeout_seconds=_int("STT_TIMEOUT_SECONDS", 90),
+        assemblyai_api_key=os.environ.get("ASSEMBLYAI_API_KEY", ""),
+        assemblyai_base_url=os.environ.get("ASSEMBLYAI_BASE_URL", "https://api.assemblyai.com"),
+        stt_language=os.environ.get("STT_LANGUAGE", "en"),
         copilot_max_calls=_int("COPILOT_MAX_CALLS", 15),
         copilot_input_tokens=_int("COPILOT_INPUT_TOKENS", 3000),
         copilot_output_tokens=_int("COPILOT_OUTPUT_TOKENS", 600),
@@ -144,4 +174,8 @@ def load_settings() -> Settings:
         eval_max_runs=_int("EVAL_MAX_RUNS", 2),
         eval_input_tokens=_int("EVAL_INPUT_TOKENS", 12_000),
         eval_output_tokens=_int("EVAL_OUTPUT_TOKENS", 2000),
+        funnel_bottleneck_max=_float("FUNNEL_BOTTLENECK_MAX", 0.2),
+        funnel_flat_min=_float("FUNNEL_FLAT_MIN", 0.9),
+        funnel_shortlist_n=_int("FUNNEL_SHORTLIST_N", 5),
+        funnel_suggest_max_per_day=_int("FUNNEL_SUGGEST_MAX_PER_DAY", 3),
     )

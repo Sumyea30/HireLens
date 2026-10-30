@@ -41,8 +41,9 @@ export interface Job {
 }
 
 export type CandidateStatus =
-  | "queued" | "processing" | "screened" | "failed"
+  | "queued" | "processing" | "screened" | "failed" | "incomplete"
   | "interview_scheduled" | "interviewed" | "assessed";
+export type FaceCheckResult = { match: boolean; score: number; reason: string };
 export interface Candidate {
   id: string;
   job_id: string;
@@ -52,6 +53,9 @@ export interface Candidate {
   source: "email" | "upload";
   received_at: string;
   assessment_id: string | null;
+  has_photo?: boolean;
+  photo_url?: string | null;
+  real_name?: string | null;
 }
 export interface EvidenceItem { ref: string; text: string }
 export type MatchStatus = "met" | "partial" | "unmet";
@@ -137,6 +141,11 @@ export interface TranscriptTurn {
   start_ms: number;
   end_ms: number;
   text: string;
+  confidence?: number | null;
+  original_text?: string | null;
+  edited?: boolean;
+  /** Non-Latin script detected; excluded from eval until edited. */
+  language_mismatch?: boolean;
 }
 export interface TranscriptDocument {
   interview_id: string;
@@ -279,16 +288,74 @@ export interface CvBatchFile {
 }
 export interface CvBatchResult { files: CvBatchFile[]; review: CvReview }
 
+export type FunnelLabel = "bottleneck" | "non_discriminating" | "balanced";
+export interface FunnelRequirement {
+  requirement_id: string;
+  text: string;
+  kind: "required" | "preferred";
+  mandatory: boolean;
+  met: number;
+  partial: number;
+  unmet: number;
+  pass_rate: number;
+  label: FunnelLabel;
+}
+export interface FunnelCandidate {
+  id: string;
+  name: string;
+  aggregate_score: number;
+  coverage_estimate: number;
+  in_shortlist: boolean;
+}
+export interface FunnelWhatIf {
+  requirement_id: string;
+  text: string;
+  shortlist_size: number;
+  entering: { id: string; name: string; coverage_estimate: number }[];
+}
+export interface FunnelNearMiss {
+  candidate_id: string;
+  name: string;
+  requirement_id: string;
+  requirement_text: string;
+  evidence_refs: string[];
+  coverage_estimate: number;
+  aggregate_score: number;
+}
+export interface FunnelReport {
+  job_id: string;
+  job_title: string;
+  candidate_count: number;
+  low_sample: boolean;
+  shortlist_n: number;
+  shortlist: { id: string; name: string; aggregate_score: number; coverage_estimate: number }[];
+  candidates: FunnelCandidate[];
+  requirements: FunnelRequirement[];
+  what_if: FunnelWhatIf[];
+  near_miss: FunnelNearMiss[];
+  thresholds: { bottleneck_max: number; flat_min: number; shortlist_n: number };
+  coverage_note: string;
+}
+export interface FunnelSuggestResult {
+  summary: string;
+  feedback: string;
+  assistant: AssistantReply | null;
+  fed_to_assistant: boolean;
+}
+
 // WebSocket protocol for the interview room (see README, "Realtime protocol")
 export type SignalKind = "offer" | "answer" | "ice";
+export type SttStatusState = "listening" | "transcribing" | "unavailable";
 export type RoomIn =
   | { type: "signal"; kind: SignalKind; data: unknown }
   | { type: "transcript"; turn: TranscriptTurn }
+  | { type: "stt_status"; state?: SttStatusState; pending?: number; message?: string }
+  | { type: "speech_activity"; active: boolean; speaker: "interviewer" | "candidate" | string }
   | { type: "coverage"; items: CoverageItem[] }
   | { type: "peer"; state: "joined" | "left" | "ready" }
   | { type: "ended" };
 export type RoomOut =
   | { type: "auth"; token: string }
   | { type: "ready" }
-  | { type: "speech"; text: string }
-  | { type: "signal"; kind: SignalKind; data: unknown };
+  | { type: "signal"; kind: SignalKind; data: unknown }
+  | { type: "speech"; text: string };

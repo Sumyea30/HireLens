@@ -164,7 +164,7 @@ def evidence(ref: str, req: Request, user: dict = Depends(staff)):
 
 
 @router.get("/audit")
-def get_audit(req: Request, user: dict = Depends(staff)):
+def get_audit(req: Request, user: dict = Depends(require_roles("admin"))):
     return req.app.state.services.store.list_audit(200)
 
 

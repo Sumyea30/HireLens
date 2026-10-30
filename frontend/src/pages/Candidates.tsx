@@ -16,7 +16,10 @@ export default function Candidates() {
   const job = params.get("job") ?? "";
   const nav = useNavigate();
   const jobs = useAsync(() => api.listJobs(), []);
-  const { data, error, loading, reload } = useAsync(() => api.listCandidates(job || undefined), [job], {
+  const { data, error, loading, reload } = useAsync(async () => {
+    try { await api.checkMail(); } catch { /* inbox optional; still show candidates */ }
+    return api.listCandidates(job || undefined);
+  }, [job], {
     pollMs: 3000, pollWhile: (d) => d.some((c) => BUSY.includes(c.status)),
   });
   const [picked, setPicked] = useState<string[]>([]);

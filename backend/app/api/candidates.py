@@ -1,22 +1,33 @@
 """CV collection endpoints (F2): upload, list, view, and delete a candidate with all their data."""
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
+from fastapi.responses import Response
 
 from app.api.access import require_job
 from app.api.audit import audit
+from app.api.pii import attach_contact, public_candidate
 from app.core.auth import require_roles
+from app.services.mail import check_inbox
 from app.services.review import build_review
 from app.services.screening import screen_many
 
 router = APIRouter()
 staff = require_roles("interviewer", "admin")
+admin = require_roles("admin")
 MAX_FILES_PER_REQUEST = 20
 
 
-def _view(c: dict) -> dict:
-    # The display name never comes from the file name. CV parsing fills the real name later.
-    return {"id": c["id"], "job_id": c["job_id"], "name": c["name"] or f"Applicant {c['id'][-4:].upper()}",
-            "status": c["status"], "aggregate_score": c["aggregate_score"], "source": c["source"],
-            "received_at": c["received_at"], "assessment_id": c["assessment_id"]}
+@router.post("/mail/check")
+def check_mail(req: Request, user: dict = Depends(staff)):
+    """Poll the application inbox once. Called when staff refresh Candidates or Dashboard."""
+    svc = req.app.state.services
+    result = check_inbox(svc.settings, svc.intake, svc.store)
+    if result.get("ok") and result.get("counts") and any(result["counts"].values()):
+        audit(req, user["role"], "mail_checked", "mailbox", "inbox", "ok")
+    return result
+
+
+def _view(user: dict, c: dict) -> dict:
+    return public_candidate(user, c)
 
 
 def _empty_parsed() -> dict:
@@ -132,7 +143,7 @@ def list_candidates(req: Request, job_id: str | None = None, user: dict = Depend
     if user["role"] != "admin" and not job_id:
         mine = {j["id"] for j in store.list_jobs() if j.get("owner_id") == user["sub"]}
         rows = [c for c in rows if c["job_id"] in mine]
-    return [_view(c) for c in rows]
+    return [_view(user, c) for c in rows]
 
 
 @router.get("/candidates/{candidate_id}")
@@ -147,11 +158,23 @@ def get_candidate(candidate_id: str, req: Request, user: dict = Depends(staff)):
     if report:
         from app.services.evaluate import public_assessment
         evaluation = public_assessment(store, report)
-    return {**_view(c), "email": c.get("email"), "phone": c.get("phone"), "failure_reason": c.get("failure_reason"),
-            **_screening(store, c), "notes": store.list_notes(candidate_id), "evaluation": evaluation}
+    view = attach_contact(user, _view(user, c), c)
+    return {**view, **_screening(store, c), "notes": store.list_notes(candidate_id), "evaluation": evaluation}
+
+
+@router.get("/admin/candidates/{candidate_id}/photo")
+def candidate_photo(candidate_id: str, req: Request, user: dict = Depends(admin)):
+    svc = req.app.state.services
+    c = svc.store.get_candidate(candidate_id)
+    if not c or not c.get("photo_path"):
+        raise HTTPException(404, "Not found")
+    data = svc.photos.read(c["photo_path"]) if svc.photos else None
+    if not data:
+        raise HTTPException(404, "Not found")
+    return Response(content=data, media_type="image/jpeg")
 
 
 @router.delete("/admin/candidates/{candidate_id}", status_code=204)
-def delete_candidate(candidate_id: str, req: Request, user: dict = Depends(require_roles("admin"))):
+def delete_candidate(candidate_id: str, req: Request, user: dict = Depends(admin)):
     if not req.app.state.services.intake.delete_candidate(candidate_id, user["role"]):
         raise HTTPException(404, "Not found")

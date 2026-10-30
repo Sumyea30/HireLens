@@ -1,8 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { api } from "../api";
 import { USE_MOCK } from "../api/client";
 import { openRoomSocket, type RoomConnState, type RoomSocket } from "../api/socket";
 import { log } from "../lib/logger";
-import type { CoverageItem, Role, RoomIn, SignalKind, TranscriptTurn } from "../lib/types";
+import { startBrowserSpeech, type BrowserSpeechSender } from "../lib/browserSpeech";
+import { startPcmCapture, type PcmSender } from "../lib/pcmCapture";
+import type { CoverageItem, FaceCheckResult, Role, RoomIn, SignalKind, TranscriptTurn } from "../lib/types";
+
+/** Mirror backend STT_PROVIDER=browser. Audio goes to the browser/Google speech service. */
+const USE_BROWSER_STT = (import.meta.env.VITE_STT_PROVIDER as string | undefined)?.trim().toLowerCase() === "browser";
+const BROWSER_STT_LANG = (import.meta.env.VITE_BROWSER_STT_LANG as string | undefined)?.trim() || "en-IN";
 
 const DEFAULT_ICE: RTCIceServer[] = [
   { urls: "stun:stun.l.google.com:19302" },
@@ -39,16 +46,49 @@ export function useInterviewRoom(interviewId: string, token: string, role: Role)
   const [mediaError, setMediaError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [speechNote, setSpeechNote] = useState<string | null>(null);
+  const [sttNote, setSttNote] = useState<string | null>(null);
+  const [sttState, setSttState] = useState<"listening" | "transcribing" | "unavailable" | null>(null);
+  const [sttPending, setSttPending] = useState(0);
+  const [speechActive, setSpeechActive] = useState(false);
+  const [caption, setCaption] = useState<TranscriptTurn | null>(null);
+  const [faceCheck, setFaceCheck] = useState<FaceCheckResult | null>(null);
+  const faceTried = useRef(false);
+  const captionTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const stream = useRef<MediaStream | null>(null);
   const sock = useRef<RoomSocket | null>(null);
   const pc = useRef<RTCPeerConnection | null>(null);
-  const speech = useRef<{ stop: () => void } | null>(null);
+  const pcm = useRef<PcmSender | null>(null);
+  const browserSpeech = useRef<BrowserSpeechSender | null>(null);
   const mutedRef = useRef(false);
+  const isStaff = role === "interviewer" || role === "admin";
+  const [sttMode] = useState<"pcm" | "browser">(USE_BROWSER_STT ? "browser" : "pcm");
   const offered = useRef(false);
   const pendingIce = useRef<RTCIceCandidateInit[]>([]);
   const epoch = useRef(0);
   const restarts = useRef(0);
   const chain = useRef(Promise.resolve());
+
+  useEffect(() => {
+    if (!isStaff || USE_MOCK || !interviewId) return;
+    let cancel = false;
+    const mergeTurns = (incoming: TranscriptTurn[]) => {
+      if (cancel || !incoming.length) return;
+      setTurns((list) => {
+        const byId = new Map(list.map((t) => [t.turn_id, t]));
+        for (const t of incoming) byId.set(t.turn_id, t);
+        return [...byId.values()].sort((a, b) => (a.start_ms ?? 0) - (b.start_ms ?? 0));
+      });
+      const latest = [...incoming].sort((a, b) => (a.start_ms ?? 0) - (b.start_ms ?? 0)).at(-1);
+      if (latest) setCaption((cur) => cur ?? latest);
+    };
+    const pull = () => {
+      api.getTranscript(interviewId).then((doc) => mergeTurns(doc?.turns ?? [])).catch(() => {});
+    };
+    pull();
+    // WS can miss a broadcast after refresh; poll as a safety net.
+    const timer = window.setInterval(pull, 4000);
+    return () => { cancel = true; window.clearInterval(timer); };
+  }, [interviewId, isStaff]);
 
   useEffect(() => {
     let cancelled = false;
@@ -206,11 +246,37 @@ export function useInterviewRoom(interviewId: string, token: string, role: Role)
 
     const onMessage = (m: RoomIn) => {
       if (cancelled) return;
-      if (m.type === "transcript") {
-        setTurns((list) => (list.some((t) => t.turn_id === m.turn.turn_id) ? list : [...list, m.turn]));
+      if (m.type === "stt_status") {
+        // Server only sends these to staff; ignore if a candidate ever receives one.
+        if (!isStaff) return;
+        if (m.state) setSttState(m.state);
+        if (typeof m.pending === "number") setSttPending(m.pending);
+        if (m.message) setSttNote(m.message);
+        else if (m.state === "listening") setSttNote(null);
         return;
       }
-      if (m.type === "coverage") { setCoverage(m.items); return; }
+      if (m.type === "speech_activity") {
+        if (!isStaff) return;
+        setSpeechActive(!!m.active);
+        return;
+      }
+      if (m.type === "transcript") {
+        // Server only sends these to staff; ignore if a candidate ever receives one.
+        if (!isStaff) return;
+        if (!m.turn?.turn_id || !m.turn?.text) return;
+        setTurns((list) => {
+          const i = list.findIndex((t) => t.turn_id === m.turn.turn_id);
+          if (i < 0) return [...list, m.turn];
+          const next = list.slice();
+          next[i] = m.turn;
+          return next;
+        });
+        // Keep the latest caption on-screen until a newer turn replaces it.
+        setCaption(m.turn);
+        if (captionTimer.current) clearTimeout(captionTimer.current);
+        return;
+      }
+      if (m.type === "coverage") { if (isStaff) setCoverage(m.items); return; }
       if (m.type === "ended") {
         setEnded(true);
         teardown();
@@ -249,12 +315,22 @@ export function useInterviewRoom(interviewId: string, token: string, role: Role)
       let media: MediaStream | null = null;
       try {
         media = await navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+          // Prefer 16 kHz mono for STT. Keep AGC; avoid aggressive NS that
+          // can strip speech energy before it reaches AssemblyAI.
+          audio: {
+            channelCount: 1,
+            sampleRate: { ideal: 16000 },
+            echoCancellation: true,
+            noiseSuppression: false,
+            autoGainControl: true,
+          },
           video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
         });
       } catch {
         try {
-          media = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+          media = await navigator.mediaDevices.getUserMedia({
+            audio: { channelCount: 1, echoCancellation: true, noiseSuppression: false, autoGainControl: true },
+          });
           if (!cancelled) setMediaError("Your camera is not available, so you are joining with audio only.");
         } catch {
           if (!cancelled) setMediaError("We could not access your microphone or camera. Allow access in your browser and reload the page.");
@@ -279,32 +355,29 @@ export function useInterviewRoom(interviewId: string, token: string, role: Role)
       if (cancelled) { socket.close(); media?.getTracks().forEach((t) => t.stop()); return; }
       sock.current = socket;
 
-      const SpeechApi = (window as unknown as { SpeechRecognition?: new () => BrowserSpeech; webkitSpeechRecognition?: new () => BrowserSpeech }).SpeechRecognition
-        || (window as unknown as { webkitSpeechRecognition?: new () => BrowserSpeech }).webkitSpeechRecognition;
-      if (!SpeechApi) {
-        setSpeechNote("This browser cannot transcribe speech. The call still works. Chrome can transcribe each person's microphone.");
-      } else if (!USE_MOCK) {
-        const heard = new SpeechApi();
-        heard.continuous = true;
-        heard.interimResults = false;
-        heard.onresult = (ev) => {
-          for (let i = ev.resultIndex; i < ev.results.length; i += 1) {
-            const said = ev.results[i];
-            if (!said.isFinal || mutedRef.current) continue;
-            const text = said[0].transcript.trim();
-            if (text) sock.current?.send({ type: "speech", text });
+      if (!USE_MOCK && media) {
+        if (USE_BROWSER_STT) {
+          if (isStaff) {
+            setSpeechNote("Browser speech (lower accuracy). Audio is processed by Google’s speech service in this browser.");
           }
-        };
-        heard.onerror = (ev) => {
-          if (ev.error === "not-allowed" || ev.error === "service-not-allowed") {
-            setSpeechNote("Speech recognition is blocked in this browser. The call still works.");
-          }
-        };
-        heard.onend = () => { if (!cancelled) { try { heard.start(); } catch { /* already running */ } } };
-        try { heard.start(); speech.current = heard; }
-        catch { setSpeechNote("Speech recognition did not start. The call still works."); }
+          const speech = startBrowserSpeech((text) => {
+            if (mutedRef.current || cancelled) return;
+            sock.current?.send({ type: "speech", text });
+          }, BROWSER_STT_LANG);
+          if (cancelled) { speech?.stop(); return; }
+          if (speech) browserSpeech.current = speech;
+          else if (isStaff) setSpeechNote("This browser does not support SpeechRecognition. The call still works.");
+        } else {
+          const capture = await startPcmCapture(media, (buf) => {
+            if (mutedRef.current || cancelled) return;
+            sock.current?.sendAudio(buf);
+          });
+          if (cancelled) { capture?.stop(); return; }
+          if (capture) pcm.current = capture;
+          else if (isStaff) setSpeechNote("This browser cannot send audio for transcription. The call still works.");
+        }
       }
-      log.info("room_started", { role });
+      log.info("room_started", { role, stt: USE_BROWSER_STT ? "browser" : "pcm" });
     })();
 
     return () => {
@@ -312,7 +385,11 @@ export function useInterviewRoom(interviewId: string, token: string, role: Role)
       epoch.current += 1;
       offered.current = false;
       pendingIce.current = [];
-      try { speech.current?.stop(); } catch { /* recognition already stopped */ }
+      try { pcm.current?.stop(); } catch { /* capture already stopped */ }
+      pcm.current = null;
+      try { browserSpeech.current?.stop(); } catch { /* already stopped */ }
+      browserSpeech.current = null;
+      if (captionTimer.current) clearTimeout(captionTimer.current);
       sock.current?.close();
       sock.current = null;
       if (pc.current) {
@@ -325,7 +402,45 @@ export function useInterviewRoom(interviewId: string, token: string, role: Role)
       stream.current?.getTracks().forEach((t) => t.stop());
       log.info("room_left", { role });
     };
-  }, [interviewId, token, role]);
+  }, [interviewId, token, role, isStaff]);
+
+  useEffect(() => {
+    if (!isStaff || USE_MOCK || !interviewId || !remote || faceTried.current) return;
+    const track = remote.getVideoTracks()[0];
+    if (!track || track.readyState !== "live") return;
+    faceTried.current = true;
+    let cancelled = false;
+    const run = async (attempt: number) => {
+      try {
+        const stream = new MediaStream([track]);
+        const video = document.createElement("video");
+        video.srcObject = stream;
+        video.muted = true;
+        await video.play().catch(() => undefined);
+        await new Promise((r) => setTimeout(r, 400));
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(160, video.videoWidth || 320);
+        canvas.height = Math.max(120, video.videoHeight || 240);
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.85));
+        video.srcObject = null;
+        if (!blob || cancelled) return;
+        const result = await api.faceCheck(interviewId, blob);
+        if (!cancelled) setFaceCheck(result);
+        if (result.reason === "no_face" && attempt < 1) {
+          faceTried.current = false;
+          setTimeout(() => { if (!cancelled) { faceTried.current = true; void run(attempt + 1); } }, 1500);
+        }
+      } catch (err) {
+        log.warn("face_check_failed", { err: String(err) });
+        if (!cancelled) setFaceCheck({ match: false, score: 0, reason: "error" });
+      }
+    };
+    void run(0);
+    return () => { cancelled = true; };
+  }, [isStaff, interviewId, remote]);
 
   const toggleMute = useCallback(() => {
     const next = !mutedRef.current;
@@ -340,15 +455,13 @@ export function useInterviewRoom(interviewId: string, token: string, role: Role)
     setCameraOff(turningOff);
   }, []);
 
-  return { local, remote, conn, peer, turns, coverage, muted, cameraOff, ended, mediaError, notice, speechNote, toggleMute, toggleCamera };
-}
+  const replaceTurn = useCallback((turn: TranscriptTurn) => {
+    setTurns((list) => list.map((t) => (t.turn_id === turn.turn_id ? turn : t)));
+  }, []);
 
-type BrowserSpeech = {
-  continuous: boolean;
-  interimResults: boolean;
-  onresult: ((ev: { resultIndex: number; results: ArrayLike<{ isFinal: boolean; 0: { transcript: string } }> }) => void) | null;
-  onerror: ((ev: { error: string }) => void) | null;
-  onend: (() => void) | null;
-  start: () => void;
-  stop: () => void;
-};
+  return {
+    local, remote, conn, peer, turns, coverage, muted, cameraOff, ended, mediaError, notice,
+    speechNote, sttNote, sttState, sttPending, speechActive, caption, sttMode, faceCheck,
+    toggleMute, toggleCamera, replaceTurn,
+  };
+}

@@ -1,7 +1,9 @@
 import { Trash2 } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, errorMessage } from "../api";
+import { API_BASE } from "../api/client";
+import { getSession } from "../auth/session";
 import { useAuth } from "../auth/AuthContext";
 import { useToast } from "../components/Toast";
 import { Badge, Bar, Button, Card, Chips, ErrorState, Modal, PageHeader, Spinner, Tabs } from "../components/ui";
@@ -20,6 +22,20 @@ export default function CandidateDetail() {
   const [tab, setTab] = useState<"scores" | "reqs" | "cv">("scores");
   const [confirm, setConfirm] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [photoSrc, setPhotoSrc] = useState<string | null>(null);
+  useEffect(() => {
+    if (!c?.photo_url) { setPhotoSrc(null); return; }
+    let objectUrl: string | null = null;
+    let cancel = false;
+    (async () => {
+      const token = getSession()?.token;
+      const res = await fetch(`${API_BASE}${c.photo_url}`, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+      if (!res.ok || cancel) return;
+      objectUrl = URL.createObjectURL(await res.blob());
+      if (!cancel) setPhotoSrc(objectUrl);
+    })().catch(() => undefined);
+    return () => { cancel = true; if (objectUrl) URL.revokeObjectURL(objectUrl); };
+  }, [c?.photo_url]);
   if (loading) return <Spinner />;
   if (error || !c) return <ErrorState message={error ?? "Not found"} onRetry={reload} />;
 
@@ -31,16 +47,25 @@ export default function CandidateDetail() {
 
   return (
     <>
-      <PageHeader title={c.name} subtitle={c.email ? `${c.email} · ${c.phone ?? ""}` : "No contact details extracted"}
+      <PageHeader title={can("delete") && c.real_name ? c.real_name : c.name}
+        subtitle={c.email ? `${c.email}${c.phone ? ` · ${c.phone}` : ""}` : "No contact details extracted"}
         actions={<>
-          <Badge tone={c.status === "failed" ? "bad" : "info"}>{titleCase(c.status)}</Badge>
+          <Badge tone={c.status === "failed" ? "bad" : c.status === "incomplete" ? "warn" : "info"}>{titleCase(c.status)}</Badge>
           {(c.assessment_id || c.evaluation) && <Link className="btn" to={`/assessments/${c.assessment_id || c.evaluation?.id}`}>View assessment</Link>}
           {c.status !== "failed" && !c.assessment_id && !c.evaluation && <Link className="btn btn-primary" to="/interviews">Schedule interview</Link>}
           {can("delete") && <Button variant="danger" onClick={() => setConfirm(true)}><Trash2 size={16} /> Delete data</Button>}
         </>} />
+      {c.status === "incomplete" && (
+        <ErrorState message="This CV is incomplete. Waiting for a reply with a photo and email address." />
+      )}
+      {can("delete") && photoSrc && (
+        <Card title="Candidate photo">
+          <img src={photoSrc} alt="" style={{ maxWidth: 160, borderRadius: 8 }} />
+        </Card>
+      )}
       {c.status === "failed" ? (
         <ErrorState message={c.failure_reason ?? "This CV could not be processed."} />
-      ) : (
+      ) : c.status === "incomplete" ? null : (
         <>
           <div className="grid-3">
             <Card title="Overall score"><strong style={{ fontSize: "2.4rem" }} className={`t-${scoreTone(c.aggregate_score ?? 0)}`}>{c.aggregate_score ?? "-"}</strong><p className="muted small">Weighted from the dimension scores below.</p></Card>

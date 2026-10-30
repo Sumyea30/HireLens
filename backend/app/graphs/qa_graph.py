@@ -132,6 +132,8 @@ def build_qa_graph(deps: Deps):
             turns = deps.repo.load_transcript(state["session_id"])
         except Exception as exc:
             return {"turns": [], "errors": [error_record("load_transcript", exc)]}
+        from app.services.language_guard import usable_for_prompts
+        turns = [t for t in turns if usable_for_prompts(t)]
         return {"turns": sorted(turns, key=lambda t: t["start_ms"])}
 
     def classify_turns(state: QAState) -> dict:

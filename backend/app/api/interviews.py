@@ -5,18 +5,19 @@ import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.api.access import require_job
 from app.api.audit import audit
+from app.api.pii import display_name
 from app.api.schemas import InterviewIn, JoinIn
 from app.core.auth import current_user, issue_token, require_roles
 from app.services.copilot import LimitReached, suggest
 from app.services.evaluate import NotReady, public_assessment, run_evaluation
-from app.services.invite import INVITE_MINUTES, invite_parts, send_invite, smtp_account
-from app.services.transcript import seal_transcript
+from app.services.invite import INVITE_MINUTES, invite_parts, join_blocked, send_invite, smtp_account
+from app.services.transcript import edit_turn_text, seal_transcript
 
 log = logging.getLogger("hirelens.api")
 router = APIRouter()
@@ -55,14 +56,20 @@ class NoteIn(BaseModel):
     mark: bool = False
 
 
+class TurnEditIn(BaseModel):
+    text: str = Field(min_length=1, max_length=4000)
+
+
 def _hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
-def _public(row: dict, token: str = "") -> dict:
+def _public(row: dict, token: str = "", user: dict | None = None) -> dict:
+    reveal = (user or {}).get("role") == "admin"
+    anon = display_name({"id": row["candidate_id"], "name": row.get("candidate_name")}, reveal=reveal)
     return {
         "id": row["id"], "job_id": row["job_id"], "job_title": row.get("job_title") or "",
-        "candidate_id": row["candidate_id"], "candidate_name": row.get("candidate_name") or "Candidate",
+        "candidate_id": row["candidate_id"], "candidate_name": anon,
         "status": row["status"], "created_at": row.get("created_at"), "scheduled_at": row.get("scheduled_at"),
         "started_at": row.get("started_at"), "ended_at": row.get("ended_at"), "join_token": token,
     }
@@ -114,25 +121,42 @@ def _deliver(settings, to: str, parts) -> tuple[bool, str | None]:
         return False, text
 
 
-def _send_both(req, row, starts: datetime, candidate_url: str, candidate_email: str, interviewer_email: str) -> dict:
+def _company_name(job: dict | None) -> str:
+    if not job:
+        return ""
+    profile = job.get("profile") or {}
+    return str(profile.get("company") or "").strip()
+
+
+def _send_both(req, row, starts: datetime, candidate_url: str, candidate_email: str, interviewer_email: str,
+               *, job: dict | None = None, candidate: dict | None = None) -> dict:
     settings = req.app.state.services.settings
+    store = req.app.state.services.store
     base = settings.public_base_url
     organizer = _organizer(settings)
     uid = row.get("calendar_uid") or f"{row['id']}@hirelens"
     sequence = int(row.get("calendar_sequence") or 0)
     interviewer_url = f"{base}/interviews/{row['id']}/room"
     others = [interviewer_email] if interviewer_email else []
+    job = job or store.get_job(row["job_id"]) or {}
+    candidate = candidate or store.get_candidate(row["candidate_id"]) or {}
+    company = _company_name(job)
+    job_id = str(job.get("id") or row.get("job_id") or "")
+    applied_at = candidate.get("received_at")
+    title = row.get("job_title") or job.get("title") or "the role"
+    shared = dict(
+        job_title=title, starts_at=starts, uid=uid, sequence=sequence, organizer=organizer,
+        job_id=job_id, applied_at=applied_at, company_name=company, recruiter_email=interviewer_email or organizer,
+    )
     candidate_parts = invite_parts(
-        job_title=row.get("job_title") or "the role", starts_at=starts, room_url=candidate_url,
-        uid=uid, sequence=sequence, organizer=organizer, attendee=candidate_email, extra_attendees=others,
+        room_url=candidate_url, attendee=candidate_email, extra_attendees=others, audience="candidate", **shared,
     )
     sent, error = _deliver(settings, candidate_email, candidate_parts)
     interviewer_sent, interviewer_error = False, None
     if interviewer_email:
         staff_parts = invite_parts(
-            job_title=row.get("job_title") or "the role", starts_at=starts, room_url=interviewer_url,
-            uid=uid, sequence=sequence, organizer=organizer, attendee=interviewer_email,
-            extra_attendees=[candidate_email],
+            room_url=interviewer_url, attendee=interviewer_email, extra_attendees=[candidate_email],
+            audience="staff", **shared,
         )
         interviewer_sent, interviewer_error = _deliver(settings, interviewer_email, staff_parts)
     else:
@@ -162,7 +186,7 @@ def _elapsed_ms(started_at: str | None) -> int:
 def list_interviews(req: Request, user: dict = Depends(staff)):
     store = req.app.state.services.store
     allowed = _visible(store, user)
-    return [_public(row) for row in store.list_interviews() if row["job_id"] in allowed]
+    return [_public(row, user=user) for row in store.list_interviews() if row["job_id"] in allowed]
 
 
 @router.get("/interviews/{interview_id}")
@@ -174,10 +198,10 @@ def get_interview(interview_id: str, req: Request, user: dict = Depends(current_
     if user["role"] == "candidate":
         if user["sub"] != row["candidate_id"]:
             raise HTTPException(404, "Not found")
-        return _public(row)
+        return _public(row, user=user)
     if row["job_id"] not in _visible(store, user):
         raise HTTPException(404, "Not found")
-    return _public(row)
+    return _public(row, user=user)
 
 
 @router.post("/interviews")
@@ -201,9 +225,11 @@ def create_interview(body: InterviewIn, req: Request, user: dict = Depends(staff
     })
     settings = req.app.state.services.settings
     room_url = f"{settings.public_base_url}/join/{token}"
-    mailed = _send_both(req, row, starts, room_url, email, _interviewer_email(store, settings, user))
+    mailed = _send_both(
+        req, row, starts, room_url, email, _interviewer_email(store, settings, user), job=job, candidate=cand,
+    )
     audit(req, user["role"], "interview_created", "interview", interview_id, "ok" if mailed["email_sent"] else "error")
-    return {**_public(row, token), **mailed, "duration_minutes": INVITE_MINUTES}
+    return {**_public(row, token, user=user), **mailed, "duration_minutes": INVITE_MINUTES}
 
 
 @router.post("/interviews/{interview_id}/reschedule")
@@ -220,9 +246,13 @@ def reschedule_interview(interview_id: str, body: RescheduleIn, req: Request, us
     if not row:
         raise HTTPException(404, "Not found")
     settings = req.app.state.services.settings
-    mailed = _send_both(req, row, starts, f"{settings.public_base_url}/join/{token}", email, _interviewer_email(store, settings, user))
+    job = store.get_job(row["job_id"])
+    mailed = _send_both(
+        req, row, starts, f"{settings.public_base_url}/join/{token}", email,
+        _interviewer_email(store, settings, user), job=job, candidate=cand,
+    )
     audit(req, user["role"], "interview_rescheduled", "interview", interview_id, "ok" if mailed["email_sent"] else "error")
-    return {**_public(row, token), **mailed, "duration_minutes": INVITE_MINUTES}
+    return {**_public(row, token, user=user), **mailed, "duration_minutes": INVITE_MINUTES}
 
 
 @router.post("/interviews/{interview_id}/end")
@@ -256,6 +286,20 @@ def get_transcript(interview_id: str, req: Request, user: dict = Depends(staff))
     return doc
 
 
+@router.patch("/interviews/{interview_id}/transcript/turns/{turn_id}")
+def edit_transcript_turn(interview_id: str, turn_id: str, body: TurnEditIn, req: Request, user: dict = Depends(staff)):
+    """Correct a turn before the transcript is sealed. Candidates always get 403 via staff gate."""
+    store = req.app.state.services.store
+    row = _staff_interview(store, user, interview_id)
+    if row.get("status") == "completed":
+        raise HTTPException(409, "This transcript is sealed and cannot be edited.")
+    turn = edit_turn_text(store, interview_id, turn_id, body.text)
+    if not turn:
+        raise HTTPException(404, "Not found")
+    audit(req, user["role"], "transcript_edited", "interview", interview_id)
+    return turn
+
+
 @router.get("/interviews/{interview_id}/brief")
 def interview_brief(interview_id: str, req: Request, user: dict = Depends(staff)):
     store = req.app.state.services.store
@@ -263,14 +307,41 @@ def interview_brief(interview_id: str, req: Request, user: dict = Depends(staff)
     cand = store.get_candidate(row["candidate_id"]) or {}
     screening = _screening(store, cand) if cand else {"dimension_scores": [], "matches": []}
     gaps = [m for m in screening["matches"] if m["status"] != "met"]
+    # Interview room: staff may see the real name here; photo is never returned.
     return {
-        "name": cand.get("name") or row.get("candidate_name") or "Candidate",
+        "name": display_name(cand, reveal=True) if cand.get("name") else display_name(
+            {"id": row["candidate_id"], "name": row.get("candidate_name")}, reveal=True,
+        ),
         "role": row.get("job_title") or "",
         "aggregate_score": cand.get("aggregate_score"),
         "dimension_scores": screening["dimension_scores"],
         "matches": screening["matches"],
         "gaps": gaps,
     }
+
+
+@router.post("/interviews/{interview_id}/face-check")
+async def face_check(interview_id: str, req: Request, user: dict = Depends(staff),
+                     image: UploadFile = File(...)):
+    """Compare one live webcam JPEG to the stored CV face. Never returns the reference photo or embedding."""
+    svc = req.app.state.services
+    row = _staff_interview(svc.store, user, interview_id)
+    cand = svc.store.get_candidate(row["candidate_id"]) or {}
+    stored = cand.get("face_embedding")
+    if isinstance(stored, str):
+        import json
+        stored = json.loads(stored)
+    data = await image.read()
+    if not data or len(data) > 5 * 1024 * 1024:
+        raise HTTPException(422, "Send one JPEG frame under 5 MB.")
+    if not svc.face:
+        raise HTTPException(503, "Face matching is not configured.")
+    result = svc.face.match(stored, data)
+    audit(req, user["role"], "face_check", "interview", interview_id,
+          "ok" if result.get("match") else "mismatch")
+    return {"match": bool(result.get("match")), "score": float(result.get("score") or 0),
+            "reason": result.get("reason") or "ok"}
+
 
 
 @router.get("/interviews/{interview_id}/copilot")
@@ -366,6 +437,9 @@ def join_interview(token: str, body: JoinIn, req: Request):
     row = store.get_interview_by_token_hash(_hash(token))
     if not row or row["status"] == "completed":
         raise HTTPException(404, "This interview link is not valid.")
+    blocked = join_blocked(row.get("scheduled_at"), status=row.get("status"))
+    if blocked:
+        raise HTTPException(403, blocked)
     store.mark_interview_consent(row["id"])
     settings = req.app.state.services.settings
     issued = issue_token(settings.auth_secret, row["candidate_id"], row.get("candidate_name") or "Candidate", "candidate", settings.token_ttl_minutes)

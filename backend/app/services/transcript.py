@@ -30,17 +30,51 @@ def seal_transcript(store, settings, interview_id: str) -> dict:
 
 
 def record_speech(store, interview_id: str, speaker: str, text: str) -> dict | None:
-    """Append one spoken turn. Returns the stored turn (for live WebSocket broadcast)."""
+    """Legacy helper for tests: wall-clock timestamps. Prefer record_utterance."""
     started = store.ensure_started(interview_id)
     end_ms = _elapsed_ms(started)
     start_ms = max(0, end_ms - min(8000, max(400, len(text) * 50)))
+    return record_utterance(store, interview_id, speaker, text, start_ms=start_ms, end_ms=end_ms)
+
+
+def record_utterance(
+    store,
+    interview_id: str,
+    speaker: str,
+    text: str,
+    *,
+    start_ms: int,
+    end_ms: int,
+    confidence: float | None = None,
+) -> dict | None:
+    """Append one spoken turn with stream-based timestamps."""
+    from app.services.language_guard import apply_language_guard
+
+    store.ensure_started(interview_id)
+    text = " ".join((text or "").split())
+    if not text:
+        return None
     turn = {
         "speaker": "candidate" if speaker == "candidate" else "interviewer",
-        "start_ms": start_ms,
-        "end_ms": max(start_ms, end_ms),
+        "start_ms": max(0, int(start_ms)),
+        "end_ms": max(int(start_ms), int(end_ms)),
         "text": text,
     }
+    if confidence is not None:
+        turn["confidence"] = max(0.0, min(1.0, float(confidence)))
+    apply_language_guard(turn)
     return store.append_turn(interview_id, turn)
+
+
+def edit_turn_text(store, interview_id: str, turn_id: str, text: str) -> dict | None:
+    """Interviewer correction before seal. Keeps the first original in original_text.
+
+    Re-runs the language guard after the edit so a fixed Latin turn is usable in prompts.
+    """
+    text = " ".join((text or "").split())
+    if not text:
+        return None
+    return store.edit_turn(interview_id, turn_id, text)
 
 
 def _elapsed_ms(started_at: str | None) -> int:

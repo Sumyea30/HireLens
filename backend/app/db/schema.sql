@@ -76,14 +76,29 @@ CREATE TABLE IF NOT EXISTS candidate (
   email           text,
   phone           text,
   status          text NOT NULL DEFAULT 'queued' CHECK (status IN
-                    ('queued','processing','screened','failed','interview_scheduled','interviewed','assessed')),
+                    ('queued','processing','screened','failed','incomplete',
+                     'interview_scheduled','interviewed','assessed')),
   source          text NOT NULL CHECK (source IN ('email','upload')),
   file_path       text,
+  photo_path      text,
+  face_embedding  jsonb,
+  completion_requests int NOT NULL DEFAULT 0 CHECK (completion_requests >= 0 AND completion_requests <= 2),
+  completion_thread_id text,
+  completion_token text,
   failure_reason  text,
   aggregate_score numeric(5,2) CHECK (aggregate_score BETWEEN 0 AND 100),
   received_at     timestamptz NOT NULL DEFAULT now(),
   UNIQUE (id, job_id)
 );
+-- Existing databases created before identity / completeness fields.
+ALTER TABLE candidate DROP CONSTRAINT IF EXISTS candidate_status_check;
+ALTER TABLE candidate ADD CONSTRAINT candidate_status_check CHECK (status IN
+  ('queued','processing','screened','failed','incomplete','interview_scheduled','interviewed','assessed'));
+ALTER TABLE candidate ADD COLUMN IF NOT EXISTS photo_path text;
+ALTER TABLE candidate ADD COLUMN IF NOT EXISTS face_embedding jsonb;
+ALTER TABLE candidate ADD COLUMN IF NOT EXISTS completion_requests int NOT NULL DEFAULT 0;
+ALTER TABLE candidate ADD COLUMN IF NOT EXISTS completion_thread_id text;
+ALTER TABLE candidate ADD COLUMN IF NOT EXISTS completion_token text;
 
 CREATE TABLE IF NOT EXISTS application (
   id              bigserial PRIMARY KEY,

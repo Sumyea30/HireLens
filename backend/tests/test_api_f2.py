@@ -7,17 +7,18 @@ from fastapi.testclient import TestClient
 from app.graphs import Deps, build_job_post_graph, memory_checkpointer
 from app.graphs.fakes import FakeLLM
 from app.main import Services, create_app
-from app.services.intake import CVStorage, IntakeService
 from app.services.memory_store import MemoryStore
 from app.services.policy import PolicyService
-from tests.helpers_f2 import PDF, make_docx, open_job, settings
+from tests.helpers_f2 import FACE_JPEG, PDF, make_cv_docx, make_docx, open_job, settings, wired_intake
 
 
 def make_client(tmp_path, max_mb=10):
     store = MemoryStore("hiring@example.com")
     deps = Deps(llm=FakeLLM({}), store=store, repo=store)
-    intake = IntakeService(store, CVStorage(str(tmp_path / "cvs")), max_mb)
-    svc = Services(settings(), store, deps, build_job_post_graph(deps, memory_checkpointer()), PolicyService(store), intake)
+    s = settings(photo_dir=str(tmp_path / "photos"))
+    intake, photos, face = wired_intake(tmp_path, store, max_mb=max_mb, settings_obj=s)
+    svc = Services(s, store, deps, build_job_post_graph(deps, memory_checkpointer()), PolicyService(store), intake)
+    svc.photos, svc.face = photos, face
     return TestClient(create_app(svc)), store, tmp_path / "cvs"
 
 
@@ -33,19 +34,22 @@ def test_upload_stores_files_under_generated_names_and_lists_candidates(tmp_path
     c, store, cvdir = make_client(tmp_path)
     h = login(c, "ivy")
     job = open_job(store)
-    r = up(c, h, job, ("Jane Doe CV.pdf", PDF, "application/pdf"), ("resume.docx", make_docx(), "application/vnd.openxmlformats-officedocument.wordprocessingml.document"))
-    assert r.status_code == 200 and [x["status"] for x in r.json()] == ["queued", "queued"]
+    complete = make_cv_docx(name="Jane Doe", email="jane@example.com")
+    incomplete = make_docx("No contact here", photo=None)
+    r = up(c, h, job, ("Jane Doe CV.docx", complete, "application/zip"), ("resume.docx", incomplete, "application/zip"))
+    assert r.status_code == 200 and [x["status"] for x in r.json()] == ["queued", "incomplete"]
     files = sorted(p.name for p in cvdir.iterdir())
     assert len(files) == 2 and all(f.startswith("cand-") for f in files) and not any("Jane" in f or "resume" in f for f in files)
 
     cands = c.get(f"/candidates?job_id={job}", headers=h).json()
-    assert len(cands) == 2 and {x["status"] for x in cands} == {"queued"} and {x["source"] for x in cands} == {"upload"}
+    assert len(cands) == 2 and {x["status"] for x in cands} == {"queued", "incomplete"} and {x["source"] for x in cands} == {"upload"}
     assert all(x["name"].startswith("Applicant ") and "Jane" not in x["name"] for x in cands)
     detail = c.get(f"/candidates/{cands[0]['id']}", headers=h).json()
-    assert detail["matches"] == [] and detail["parsed"]["skills"] == [] and detail["email"] is None
+    assert detail["matches"] == [] and detail["parsed"]["skills"] == [] and "real_name" not in detail
     assert c.get("/candidates/nope", headers=h).status_code == 404
     assert c.get(f"/jobs/{job}", headers=h).json()["applicants"] == 2
-    assert sum(1 for e in c.get("/audit", headers=h).json() if e["action"] == "cv_received") == 2
+    assert c.get("/audit", headers=h).status_code == 403
+    assert sum(1 for e in c.get("/audit", headers=login(c, "ada")).json() if e["action"] == "cv_received") == 2
 
 
 def test_bad_files_are_rejected_with_a_reason_and_nothing_is_stored(tmp_path):
@@ -80,7 +84,7 @@ def test_access_control_and_deletion_removes_everything(tmp_path):
     assert c.post(f"/jobs/{job}/cvs", files=[("files", ("a.pdf", PDF, "application/pdf"))]).status_code == 401
     assert up(c, guest, job, ("a.pdf", PDF, "application/pdf")).status_code == 403
     assert c.get("/candidates", headers=guest).status_code == 403
-    cid = up(c, ivy, job, ("a.pdf", PDF, "application/pdf")).json() and c.get("/candidates", headers=ivy).json()[0]["id"]
+    cid = up(c, ivy, job, ("a.docx", make_cv_docx(), "application/zip")).json() and c.get("/candidates", headers=ivy).json()[0]["id"]
     other = c.post("/auth/signup", json={"name": "Samira", "email": "samira@gmail.com", "password": "long-enough"})
     hers = {"Authorization": "Bearer " + other.json()["token"]}
     assert c.get("/jobs", headers=hers).json() == []
@@ -95,7 +99,8 @@ def test_access_control_and_deletion_removes_everything(tmp_path):
     assert c.get(f"/candidates/{cid}", headers=ivy).status_code == 404
     assert store.search(f"cv:{cid}", "Python", 3) == []                                  # and its vectors
     assert c.delete(f"/admin/candidates/{cid}", headers=ada).status_code == 404
-    events = c.get("/audit", headers=ivy).json()
+    assert c.get("/audit", headers=ivy).status_code == 403
+    events = c.get("/audit", headers=ada).json()
     assert any(e["action"] == "candidate_deleted" and e["entity_id"] == cid and e["actor_role"] == "admin" for e in events)
 
 
@@ -104,8 +109,9 @@ def test_audit_and_dashboard_hold_no_usernames(tmp_path):
     c.post("/auth/login", json={"username": "ivy", "password": "wrong"})
     h = login(c, "ivy")
     job = open_job(store)
-    up(c, h, job, ("a.pdf", PDF, "application/pdf"))
-    events = c.get("/audit", headers=h).json()
+    up(c, h, job, ("a.docx", make_cv_docx(), "application/zip"))
+    assert c.get("/audit", headers=h).status_code == 403                                 # activity log is admin-only
+    events = c.get("/audit", headers=login(c, "ada")).json()
     assert {"login_failed", "login", "cv_received"} <= {e["action"] for e in events}
     assert "ivy" not in str(events)                                                      # users are identified by a short hash
     d = c.get("/dashboard/summary", headers=h).json()

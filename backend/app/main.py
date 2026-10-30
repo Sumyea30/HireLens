@@ -9,7 +9,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api import assistant, candidates, clientlog, interviews, misc, room
+from app.api import assistant, candidates, clientlog, funnel, interviews, misc, room
 from app.core.config import Settings, load_settings
 from app.graphs import CachedLLM, Deps, build_cv_graph, build_job_post_graph, memory_checkpointer
 from app.graphs.common import LLMError
@@ -17,7 +17,9 @@ from app.services.blogger import BloggerChannel
 from app.services.channels.mcp_channel import McpChannel, mcp_config
 from app.services.gemini import GeminiClient, GeminiEmbedder
 from app.services.cvtext import extract_cv_text, ocr_cv_text
+from app.services.face import FaceService, build_face_engine
 from app.services.intake import CVStorage, IntakeService
+from app.services.photos import PhotoStorage
 from app.services.screening import make_on_queued
 from app.services.memory_store import MemoryStore
 from app.services.policy import PolicyService
@@ -36,6 +38,8 @@ class Services:
     intake: Any = None
     stack: ExitStack = field(default_factory=ExitStack)
     cv_graph: Any = None
+    photos: Any = None
+    face: Any = None
 
 
 class _Unavailable:
@@ -77,11 +81,16 @@ def build_services(s: Settings) -> Services:
         store, saver = MemoryStore(s.apply_email, None if isinstance(embedder, _Unavailable) else embedder), memory_checkpointer()
     deps = Deps(llm=llm, store=store, repo=store, channels=build_channels(s), apply_email=s.apply_email,
                 extract_text=extract_cv_text, ocr_text=ocr_cv_text)
-    intake = IntakeService(store, CVStorage(s.cv_dir), s.max_upload_mb, on_queued=make_on_queued(s))
+    photos = PhotoStorage(s.photo_dir)
+    face = FaceService(build_face_engine(s.face_provider), s.face_match_threshold)
+    intake = IntakeService(
+        store, CVStorage(s.cv_dir), s.max_upload_mb, on_queued=make_on_queued(s),
+        photos=photos, face=face, settings=s,
+    )
     policy = PolicyService(store)
     policy.ensure_default_template()
     return Services(s, store, deps, build_job_post_graph(deps, saver), policy, intake, stack,
-                    build_cv_graph(deps))
+                    build_cv_graph(deps), photos, face)
 
 
 def create_app(services: Services | None = None) -> FastAPI:
@@ -118,6 +127,7 @@ def create_app(services: Services | None = None) -> FastAPI:
     app.add_middleware(CORSMiddleware, allow_origins=list(load_settings().cors_origins), allow_methods=["*"], allow_headers=["*"])
     app.include_router(misc.router)
     app.include_router(assistant.router)
+    app.include_router(funnel.router)
     app.include_router(candidates.router)
     app.include_router(interviews.router)
     app.include_router(room.router)
